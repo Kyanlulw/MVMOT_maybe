@@ -43,8 +43,8 @@ python -m torch.distributed.launch \
     --query_interaction_layer QIM \
     --extra_track_attn \
     --mot_path ${MOT_PATH} \
-    --data_txt_path_train ./datasets/data_path/multiview_wildtrack.train \
-    --data_txt_path_val ./datasets/data_path/multiview_wildtrack.val \
+    --data_txt_path_train /kaggle/input/datasets/aryashah2k/large-scale-multicamera-detection-dataset/Wildtrack \
+    --data_txt_path_val /kaggle/input/datasets/aryashah2k/large-scale-multicamera-detection-dataset/Wildtrack \
     --num_queries 300 \
     --num_cams 7 \
     --cross_view_fusion_layers 2 \
