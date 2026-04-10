@@ -18,12 +18,19 @@ import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
-import MultiScaleDeformableAttention as MSDA
+try:
+    import MultiScaleDeformableAttention as MSDA
+    HAS_MSDA = True
+except ImportError:
+    MSDA = None
+    HAS_MSDA = False
 
 
 class MSDeformAttnFunction(Function):
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
+        if not HAS_MSDA:
+            raise RuntimeError('MultiScaleDeformableAttention extension is not available.')
         ctx.im2col_step = im2col_step
         output = MSDA.ms_deform_attn_forward(
             value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
@@ -33,6 +40,8 @@ class MSDeformAttnFunction(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
+        if not HAS_MSDA:
+            raise RuntimeError('MultiScaleDeformableAttention extension is not available.')
         value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
         grad_value, grad_sampling_loc, grad_attn_weight = \
             MSDA.ms_deform_attn_backward(

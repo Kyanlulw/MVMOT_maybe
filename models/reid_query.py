@@ -20,6 +20,9 @@
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
+from pathlib import Path
+import importlib.util
+from importlib.machinery import SourceFileLoader
 
 import torch
 import torch.nn as nn
@@ -28,6 +31,78 @@ from torch import Tensor
 
 from models.structures import Instances
 from .temp import QueueMemoryBank, TrackQueue, TrackSnapshot
+
+
+def _load_transreid_vit_module():
+    """Load TransReID ViT definitions directly from models/structures/vit_pytorch."""
+    try:
+        from .structures import vit_pytorch as vit_module
+        return vit_module
+    except Exception:
+        vit_path = Path(__file__).resolve().parent / 'structures' / 'vit_pytorch'
+        if not vit_path.exists():
+            raise ImportError(f'Cannot locate TransReID ViT file at: {vit_path}')
+
+        loader = SourceFileLoader('motr_reid_query_vit', str(vit_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ImportError(f'Cannot create import spec for: {vit_path}')
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+
+class ReIDViTModel(nn.Module):
+    """Adapter that exposes the interface expected by TrajectoryReIDBackbone."""
+
+    def __init__(self, base: nn.Module, in_planes: int):
+        super().__init__()
+        self.base = base
+        self.in_planes = int(in_planes)
+
+
+def build_reid_query_vit_model(
+    transformer_type: str = 'vit_base_patch16_224_TransReID',
+    img_size: Tuple[int, int] = (256, 128),
+    stride_size: int = 16,
+    drop_rate: float = 0.0,
+    attn_drop_rate: float = 0.0,
+    drop_path_rate: float = 0.1,
+    camera_num: int = 0,
+    view_num: int = 0,
+    sie_xishu: float = 1.0,
+) -> ReIDViTModel:
+    """Build ReIDQuery backbone model directly from vit_pytorch definitions."""
+    vit_module = _load_transreid_vit_module()
+    factory = {
+        'vit_base_patch16_224_TransReID': vit_module.vit_base_patch16_224_TransReID,
+        'deit_base_patch16_224_TransReID': vit_module.vit_base_patch16_224_TransReID,
+        'vit_small_patch16_224_TransReID': vit_module.vit_small_patch16_224_TransReID,
+        'deit_small_patch16_224_TransReID': vit_module.deit_small_patch16_224_TransReID,
+    }
+    in_planes_map = {
+        'vit_base_patch16_224_TransReID': 768,
+        'deit_base_patch16_224_TransReID': 768,
+        'vit_small_patch16_224_TransReID': 768,
+        'deit_small_patch16_224_TransReID': 384,
+    }
+
+    if transformer_type not in factory:
+        supported = ', '.join(sorted(factory.keys()))
+        raise ValueError(f'Unsupported transformer_type={transformer_type!r}. Supported: {supported}')
+
+    base = factory[transformer_type](
+        img_size=img_size,
+        stride_size=stride_size,
+        drop_rate=drop_rate,
+        attn_drop_rate=attn_drop_rate,
+        drop_path_rate=drop_path_rate,
+        camera=camera_num,
+        view=view_num,
+        local_feature=False,
+        sie_xishu=sie_xishu,
+    )
+    return ReIDViTModel(base=base, in_planes=in_planes_map[transformer_type])
 
 
 # ---------------------------------------------------------------------------

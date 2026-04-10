@@ -35,7 +35,8 @@ def data_apply(data, check_func, apply_func):
             elif isinstance(data[k], dict) or isinstance(data[k], list):
                 data_apply(data[k], check_func, apply_func)
             else:
-                raise ValueError()
+                # Keep non-tensor metadata unchanged (e.g., calibration numbers/strings).
+                continue
     elif isinstance(data, list):
         for i in range(len(data)):
             if check_func(data[i]):
@@ -43,9 +44,9 @@ def data_apply(data, check_func, apply_func):
             elif isinstance(data[i], dict) or isinstance(data[i], list):
                 data_apply(data[i], check_func, apply_func)
             else:
-                raise ValueError("invalid type {}".format(type(data[i])))
+                continue
     else:
-        raise ValueError("invalid type {}".format(type(data)))
+        return data
     return data
 
 

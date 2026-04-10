@@ -9,6 +9,8 @@
 # ------------------------------------------------------------------------
 
 import torch.utils.data
+# Work around a Windows DLL import-order issue observed with torchvision -> PIL.
+from PIL import Image  # noqa: F401
 import torchvision
 
 from .coco import build as build_coco

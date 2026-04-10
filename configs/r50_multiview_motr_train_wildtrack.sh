@@ -46,7 +46,7 @@ python -m torch.distributed.launch \
     --data_txt_path_train ./datasets/data_path/multiview_wildtrack.train \
     --data_txt_path_val ./datasets/data_path/multiview_wildtrack.val \
     --num_queries 300 \
-    --num_views 7 \
+    --num_cams 7 \
     --cross_view_fusion_layers 2 \
     --cross_view_nhead 8 \
     --cross_view_dropout 0.1 \

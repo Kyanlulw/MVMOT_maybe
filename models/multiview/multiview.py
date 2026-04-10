@@ -41,39 +41,10 @@ from ..memory_bank import build_memory_bank
 from ..temp import QueueMemoryBank
 from ..deformable_detr import SetCriterion, MLP
 from ..segmentation import sigmoid_focal_loss
-from ..reid_query import ReIDQueryModule
+from ..reid_query import ReIDQueryModule, build_reid_query_vit_model
 
 # Re-use ClipMatcher unchanged — it is instantiated once per camera during training.
 from ..motr import ClipMatcher, TrackerPostProcess, RuntimeTrackerBase, _get_clones
-
-
-class _SimpleReIDViTBase(nn.Module):
-    """Minimal ViT-like container exposing blocks + norm expected by ReIDQueryModule."""
-
-    def __init__(self, embed_dim: int, num_layers: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=embed_dim * 4,
-                dropout=dropout,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True,
-            )
-            for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(embed_dim)
-
-
-class _SimpleReIDModel(nn.Module):
-    """Lightweight wrapper matching the interface expected by TrajectoryReIDBackbone."""
-
-    def __init__(self, embed_dim: int, num_layers: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.in_planes = embed_dim
-        self.base = _SimpleReIDViTBase(embed_dim, num_layers, num_heads, dropout)
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +118,16 @@ class MultiviewClipMatcher(nn.Module):
             criterion = self.criteria[cam_idx]
             losses = cam_out.pop("losses_dict")
             num_samples = criterion.get_num_boxes(criterion.num_samples)
+
+            # Match ClipMatcher.forward behaviour: normalize per-camera losses first,
+            # then optionally compose uncertainty-weighted objective.
+            losses = {loss_name: (loss_val / num_samples) for loss_name, loss_val in losses.items()}
+            if criterion.use_uncertainty_loss:
+                losses = criterion._append_uncertainty_loss(losses)
+
             for loss_name, loss_val in losses.items():
                 key = f"cam{cam_idx}_{loss_name}"
-                aggregated[key] = loss_val / num_samples
+                aggregated[key] = loss_val
         return aggregated
 
 
@@ -288,9 +266,9 @@ class MultiviewMOTR(nn.Module):
         # Per-camera post-processing and track management
         self.post_process = TrackerPostProcess()
         # One RuntimeTrackerBase per camera for inference
-        self.track_bases: List[RuntimeTrackerBase] = nn.ModuleList(
-            [RuntimeTrackerBase() for _ in range(num_cams)]
-        ) if num_cams > 0 else []
+        self.track_bases: List[RuntimeTrackerBase] = [
+            RuntimeTrackerBase() for _ in range(num_cams)
+        ] if num_cams > 0 else []
 
         self.criterion = criterion
         self.memory_bank = memory_bank
@@ -316,16 +294,24 @@ class MultiviewMOTR(nn.Module):
         if self.use_reid_query:
             track_dim = hidden_dim
             reid_dim = int(reid_vit_dim) if int(reid_vit_dim) > 0 else track_dim
-            reid_heads = max(1, int(reid_num_heads))
-            while reid_heads > 1 and (reid_dim % reid_heads != 0):
-                reid_heads -= 1
-
-            reid_model = _SimpleReIDModel(
-                embed_dim=reid_dim,
-                num_layers=max(1, int(reid_num_layers)),
-                num_heads=reid_heads,
-                dropout=float(reid_dropout),
+            reid_transformer_type = (
+                'deit_small_patch16_224_TransReID'
+                if reid_dim <= 384 else
+                'vit_base_patch16_224_TransReID'
             )
+
+            reid_model = build_reid_query_vit_model(
+                transformer_type=reid_transformer_type,
+                drop_rate=float(reid_dropout),
+                attn_drop_rate=float(reid_dropout),
+                drop_path_rate=0.1,
+                img_size=(256, 128),
+                stride_size=16,
+                camera_num=0,
+                view_num=0,
+                sie_xishu=1.0,
+            )
+
             self.reid_module = ReIDQueryModule(
                 reid_model=reid_model,
                 track_dim=track_dim,
@@ -688,8 +674,8 @@ class MultiviewMOTR(nn.Module):
         """
         assert self.training, "Use inference_single_image for inference."
 
-        imgs_per_cam: List[List[Tensor]] = data['imgs']
-        gt_per_cam: List[List[Instances]] = data['gt_instances']
+        imgs_per_cam: List[List[Tensor]] = data.get('imgs_multiview', data['imgs'])
+        gt_per_cam: List[List[Instances]] = data.get('gt_instances_multiview', data['gt_instances'])
         assert len(imgs_per_cam) == self.num_cams, \
             f"Expected {self.num_cams} cameras, got {len(imgs_per_cam)}"
 
@@ -718,6 +704,7 @@ def build(args):
         'e2e_dance': 1,
         'e2e_joint': 1,
         'e2e_static_mot': 1,
+        'e2e_mv_mot': 1,
     }
     assert args.dataset_file in dataset_to_num_classes
     num_classes = dataset_to_num_classes[args.dataset_file]

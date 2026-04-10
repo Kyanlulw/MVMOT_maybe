@@ -1,15 +1,10 @@
 # ------------------------------------------------------------------------
-# Multi-View MOTR
+# Multi-View MOTR package exports
 # ------------------------------------------------------------------------
 
-from .cross_view_attention import CrossViewAttention, CrossViewFeatureFusion
-from .cross_view_tracker import CrossViewTracker
-from .multiview_motr import MultiViewMOTR, build as build_multiview_motr
+from .multiview import MultiviewMOTR, build as build_multiview_motr
 
 __all__ = [
-    'CrossViewAttention',
-    'CrossViewFeatureFusion', 
-    'CrossViewTracker',
-    'MultiViewMOTR',
+    'MultiviewMOTR',
     'build_multiview_motr',
 ]

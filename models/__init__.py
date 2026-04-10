@@ -9,7 +9,7 @@
 
 from .deformable_detr import build as build_deformable_detr
 from .motr import build as build_motr
-from .multiview.multiview_motr import build as build_multiview_motr
+from .multiview.multiview import build as build_multiview_motr
 
 
 def build_model(args):
@@ -21,4 +21,5 @@ def build_model(args):
     assert args.meta_arch in arch_catalog, 'invalid arch: {}'.format(args.meta_arch)
     build_func = arch_catalog[args.meta_arch]
     return build_func(args)
+
 
