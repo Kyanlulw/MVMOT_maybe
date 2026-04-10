@@ -1,0 +1,14 @@
+{
+    "scenes": [
+        {
+            "name": "scene_001",
+            "cameras": ["camera_0", "camera_1"],
+            "num_frames": 50,
+            "calibration": {
+                "homographies": {
+                    "0_1": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                }
+            }
+        }
+    ]
+}

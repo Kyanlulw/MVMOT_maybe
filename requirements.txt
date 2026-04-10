@@ -1,0 +1,9 @@
+pycocotools
+tqdm
+cython
+scipy
+motmetrics
+opencv-python
+seaborn
+lap
+wandb
