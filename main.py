@@ -222,31 +222,15 @@ def get_args_parser():
 
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
 
-<<<<<<< HEAD
     # Multi-view settings
     parser.add_argument('--num_cams', default=1, type=int,
                         help='Number of camera views for multi-view tracking')
-    parser.add_argument('--cross_view_fusion_layers', default=2, type=int,
-                        help='Number of cross-view attention fusion layers')
-    parser.add_argument('--cross_view_nhead', default=8, type=int,
-                        help='Number of attention heads for cross-view attention')
-    parser.add_argument('--cross_view_dropout', default=0.1, type=float,
-                        help='Dropout for cross-view attention')
-    parser.add_argument('--enable_cross_view_query_exchange', action='store_true', default=False,
-                        help='Enable cross-view track query exchange between decoder layers')
-    parser.add_argument('--cross_view_match_thresh', default=0.3, type=float,
-                        help='Threshold for cross-view track association similarity')
-    parser.add_argument('--cross_view_loss_coef', default=1.0, type=float,
-                        help='Coefficient for cross-view consistency loss')
-    parser.add_argument('--use_geometric_constraint', action='store_true', default=False,
-                        help='Use geometric constraints (homography/fundamental matrix) for cross-view matching')
 
     # Uncertainty-based multi-task balancing between tracking and ReID losses.
     parser.add_argument('--use_uncertainty_loss', action='store_true', default=False,
                         help='Enable learnable uncertainty weighting between tracking and ReID losses')
     parser.add_argument('--uncertainty_init', default=0.0, type=float,
                         help='Initial value for tracking/ReID log-variance parameters')
-=======
     # wandb logging
     parser.add_argument('--wandb', action='store_true', default=False,
                         help='Enable Weights & Biases logging')
@@ -256,7 +240,6 @@ def get_args_parser():
                         help='W&B entity (team or username)')
     parser.add_argument('--wandb_run_name', default=None, type=str,
                         help='W&B run name (defaults to exp_name)')
->>>>>>> af60bfdcafbbf96094febbf0123e4ed457841806
     return parser
 
 
