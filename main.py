@@ -161,7 +161,7 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--vis', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num_workers', default=1, type=int)
     parser.add_argument('--pretrained', default=None, help='resume from checkpoint')
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
@@ -205,9 +205,9 @@ def get_args_parser():
                         help='Coefficient for frame_i_reid_total in standard loss summation')
     parser.add_argument('--reid_num_ids', type=int, default=2048,
                         help='Classifier size for ReID head')
-    parser.add_argument('--reid_tau1', type=int, default=10,
+    parser.add_argument('--reid_tau1', type=int, default=30,
                         help='Queue depth for ReID trajectory memory')
-    parser.add_argument('--reid_tau2', type=int, default=4,
+    parser.add_argument('--reid_tau2', type=int, default=10,
                         help='Window length from queue fed into ReID transformer')
     parser.add_argument('--reid_label_smoothing', type=float, default=0.1,
                         help='Label smoothing used in ReID CE loss')
