@@ -97,7 +97,21 @@ class MultiViewMOTDetection:
         1. JSON format: structured multi-view scene descriptions
         2. Text format: simple listing of scene/camera/frame entries
         """
-        if data_txt_path.endswith('.json'):
+        # Auto-detect JSON payloads even when files use custom extensions
+        # such as ".train" / ".val".
+        is_json = data_txt_path.endswith('.json')
+        if not is_json:
+            try:
+                with open(data_txt_path, 'r') as f:
+                    for raw_line in f:
+                        stripped = raw_line.strip()
+                        if stripped:
+                            is_json = stripped[0] in ('{', '[')
+                            break
+            except OSError:
+                is_json = False
+
+        if is_json:
             self._parse_json_format(data_txt_path, seqs_folder)
         else:
             self._parse_text_format(data_txt_path, seqs_folder)
@@ -210,6 +224,13 @@ class MultiViewMOTDetection:
         # Group by scene
         scene_cameras = {}
         for line in lines:
+            # Skip obvious JSON/object syntax lines when a JSON-like file was
+            # accidentally routed here (e.g., wrong extension).
+            if line in {'{', '}', '[', ']', ','}:
+                continue
+            if ':' in line and '"' in line and ',' not in line and '/' not in line:
+                continue
+
             parts = line.split(',') if ',' in line else line.split('/')
             if len(parts) >= 2:
                 scene_name = parts[0].strip()
