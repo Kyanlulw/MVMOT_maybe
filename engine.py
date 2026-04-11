@@ -284,6 +284,7 @@ def train_one_epoch_multiview_mot(model: torch.nn.Module, criterion: torch.nn.Mo
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
+    _wandb_step = epoch * len(data_loader)
 
     for data_dict in metric_logger.log_every(data_loader, print_freq, header):
         data_dict = data_dict_to_cuda(data_dict, device)
@@ -320,6 +321,16 @@ def train_one_epoch_multiview_mot(model: torch.nn.Module, criterion: torch.nn.Mo
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
+
+        # wandb step logging
+        if HAS_WANDB and wandb.run is not None and utils.is_main_process():
+            wandb.log({
+                'train_step/loss': loss_value,
+                'train_step/lr': optimizer.param_groups[0]["lr"],
+                'train_step/grad_norm': float(grad_total_norm),
+                **{f'train_step/{k}': float(v) for k, v in loss_dict_reduced_scaled.items()},
+            }, step=_wandb_step)
+        _wandb_step += 1
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
