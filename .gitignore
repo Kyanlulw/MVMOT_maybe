@@ -6,4 +6,3 @@ build/
 *.egg
 *.egg-info
 *.mp4
-datasets/multiview_mot.py
