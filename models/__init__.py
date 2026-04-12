@@ -9,7 +9,7 @@
 
 from .deformable_detr import build as build_deformable_detr
 from .motr import build as build_motr
-from .multiview.multiview import build as build_multiview_motr
+from .multiview import build as build_multiview_motr
 
 
 def build_model(args):
