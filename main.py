@@ -229,8 +229,12 @@ def get_args_parser():
     # Uncertainty-based multi-task balancing between tracking and ReID losses.
     parser.add_argument('--use_uncertainty_loss', action='store_true', default=False,
                         help='Enable learnable uncertainty weighting between tracking and ReID losses')
-    parser.add_argument('--uncertainty_init', default=0.0, type=float,
-                        help='Initial value for tracking/ReID log-variance parameters')
+    parser.add_argument('--uncertainty_init_tracking', default=-1.85, type=float,
+                        help='Initial value for tracking uncertainty log-variance (w1)')
+    parser.add_argument('--uncertainty_init_reid', default=-1.05, type=float,
+                        help='Initial value for ReID uncertainty log-variance (w2)')
+    parser.add_argument('--uncertainty_init', default=None, type=float,
+                        help='Deprecated shared init for both uncertainty log-variances (overrides both when set)')
     # wandb logging
     parser.add_argument('--wandb', action='store_true', default=False,
                         help='Enable Weights & Biases logging')

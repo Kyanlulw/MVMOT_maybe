@@ -72,7 +72,8 @@ class ClipMatcher(SetCriterion):
                         weight_dict,
                         losses,
                         use_uncertainty_loss: bool = False,
-                        uncertainty_init: float = 0.0):
+                        uncertainty_init_tracking: float = -1.85,
+                        uncertainty_init_reid: float = -1.05):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -92,9 +93,8 @@ class ClipMatcher(SetCriterion):
         self._current_frame_idx = 0
         self.use_uncertainty_loss = bool(use_uncertainty_loss)
         if self.use_uncertainty_loss:
-            init = float(uncertainty_init)
-            self.log_var_tracking = nn.Parameter(torch.tensor(init))
-            self.log_var_reid = nn.Parameter(torch.tensor(init))
+            self.log_var_tracking = nn.Parameter(torch.tensor(float(uncertainty_init_tracking)))
+            self.log_var_reid = nn.Parameter(torch.tensor(float(uncertainty_init_reid)))
             self.weight_dict = {'loss_uncertainty_total': 1.0}
 
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
@@ -934,13 +934,21 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes']
+    shared_uncertainty_init = getattr(args, 'uncertainty_init', None)
+    uncertainty_init_tracking = getattr(args, 'uncertainty_init_tracking', -1.85)
+    uncertainty_init_reid = getattr(args, 'uncertainty_init_reid', -1.05)
+    if shared_uncertainty_init is not None:
+        uncertainty_init_tracking = float(shared_uncertainty_init)
+        uncertainty_init_reid = float(shared_uncertainty_init)
+
     criterion = ClipMatcher(
         num_classes,
         matcher=img_matcher,
         weight_dict=weight_dict,
         losses=losses,
         use_uncertainty_loss=getattr(args, 'use_uncertainty_loss', False),
-        uncertainty_init=getattr(args, 'uncertainty_init', 0.0),
+        uncertainty_init_tracking=uncertainty_init_tracking,
+        uncertainty_init_reid=uncertainty_init_reid,
     )
     criterion.to(device)
     postprocessors = {}

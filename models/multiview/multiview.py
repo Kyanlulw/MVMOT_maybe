@@ -65,7 +65,8 @@ class MultiviewClipMatcher(nn.Module):
         weight_dict: dict,
         losses: list,
         use_uncertainty_loss: bool = False,
-        uncertainty_init: float = 0.0,
+        uncertainty_init_tracking: float = -1.85,
+        uncertainty_init_reid: float = -1.05,
     ):
         super().__init__()
         self.num_cams = num_cams
@@ -78,7 +79,8 @@ class MultiviewClipMatcher(nn.Module):
                     weight_dict,
                     losses,
                     use_uncertainty_loss=use_uncertainty_loss,
-                    uncertainty_init=uncertainty_init,
+                    uncertainty_init_tracking=uncertainty_init_tracking,
+                    uncertainty_init_reid=uncertainty_init_reid,
                 )
                 for _ in range(num_cams)
             ]
@@ -753,6 +755,12 @@ def build(args):
         memory_bank = None
 
     losses = ['labels', 'boxes']
+    shared_uncertainty_init = getattr(args, 'uncertainty_init', None)
+    uncertainty_init_tracking = getattr(args, 'uncertainty_init_tracking', -1.85)
+    uncertainty_init_reid = getattr(args, 'uncertainty_init_reid', -1.05)
+    if shared_uncertainty_init is not None:
+        uncertainty_init_tracking = float(shared_uncertainty_init)
+        uncertainty_init_reid = float(shared_uncertainty_init)
 
     criterion = MultiviewClipMatcher(
         num_cams=num_cams,
@@ -761,7 +769,8 @@ def build(args):
         weight_dict=weight_dict,
         losses=losses,
         use_uncertainty_loss=getattr(args, 'use_uncertainty_loss', False),
-        uncertainty_init=getattr(args, 'uncertainty_init', 0.0),
+        uncertainty_init_tracking=uncertainty_init_tracking,
+        uncertainty_init_reid=uncertainty_init_reid,
     )
     criterion.to(device)
 
