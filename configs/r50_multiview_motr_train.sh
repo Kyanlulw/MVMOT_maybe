@@ -12,6 +12,7 @@
 GPU_IDS=${1:-"0"}
 DATA_ROOT=${2:-"/data/multiview_mot"}
 OUTPUT_DIR=${3:-"./output/multiview_motr"}
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 GPUS=$(echo $GPU_IDS | tr ',' '\n' | wc -l)
 PORT=$(( RANDOM % 1000 + 29500 ))

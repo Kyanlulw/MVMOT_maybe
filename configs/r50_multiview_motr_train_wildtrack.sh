@@ -17,6 +17,7 @@ if [ -z "$GPU_IDS" ]; then
 fi
 
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
 PORT=$(( RANDOM % 1000 + 29500 ))
 PRETRAIN_PATH="/kaggle/input/models/trnlqung/9epochmvmot/pytorch/default/1/checkpoint0009.pth"
