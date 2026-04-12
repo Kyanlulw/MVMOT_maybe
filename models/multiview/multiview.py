@@ -490,6 +490,7 @@ class MultiviewMOTR(nn.Module):
         track_instances: Instances,
         is_last: bool,
         cam_idx: int,
+        global_frame_idx: Optional[int] = None,
     ) -> dict:
         """
         Post-process one frame for one camera.
@@ -520,11 +521,12 @@ class MultiviewMOTR(nn.Module):
 
         if self.reid_module is not None and self.reid_queue_bank is not None:
             target_ids = self._build_reid_target_ids(cam_idx, track_instances) if self.training else None
+            reid_frame_idx = self._queue_frame_idx[cam_idx] if global_frame_idx is None else int(global_frame_idx)
             track_instances, reid_loss = self.reid_module(
                 track_instances=track_instances,
                 queue_bank=self.reid_queue_bank,
                 cam_idx=cam_idx,
-                global_frame_idx=self._queue_frame_idx[cam_idx],
+                global_frame_idx=reid_frame_idx,
                 target_ids=target_ids,
             )
 
@@ -562,6 +564,7 @@ class MultiviewMOTR(nn.Module):
         self,
         frames: List[Tensor],
         cam_idx: int,
+        global_frame_idxs: Optional[List[int]] = None,
     ) -> Tuple[dict, Instances]:
         """
         Process all frames of one camera sequentially.
@@ -577,6 +580,9 @@ class MultiviewMOTR(nn.Module):
         for frame_index, frame in enumerate(frames):
             frame.requires_grad = False
             is_last = (frame_index == len(frames) - 1)
+            frame_global_idx = None
+            if global_frame_idxs is not None and frame_index < len(global_frame_idxs):
+                frame_global_idx = int(global_frame_idxs[frame_index])
 
             if self.use_checkpoint and frame_index < len(frames) - 2:
                 def fn(frame, *args):
@@ -606,7 +612,13 @@ class MultiviewMOTR(nn.Module):
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances)
 
-            frame_res = self._post_process_single_image(frame_res, track_instances, is_last, cam_idx)
+            frame_res = self._post_process_single_image(
+                frame_res,
+                track_instances,
+                is_last,
+                cam_idx,
+                global_frame_idx=frame_global_idx,
+            )
             track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
@@ -678,6 +690,7 @@ class MultiviewMOTR(nn.Module):
 
         imgs_per_cam: List[List[Tensor]] = data.get('imgs_multiview', data['imgs'])
         gt_per_cam: List[List[Instances]] = data.get('gt_instances_multiview', data['gt_instances'])
+        global_frame_idxs: Optional[List[int]] = data.get('global_frame_idxs', None)
         assert len(imgs_per_cam) == self.num_cams, \
             f"Expected {self.num_cams} cameras, got {len(imgs_per_cam)}"
 
@@ -686,7 +699,11 @@ class MultiviewMOTR(nn.Module):
         outputs_per_cam: Dict[int, dict] = {}
         for cam_idx in range(self.num_cams):
             self._reset_track_query_queue(cam_idx)
-            cam_outputs, _ = self._forward_single_camera_clip(imgs_per_cam[cam_idx], cam_idx)
+            cam_outputs, _ = self._forward_single_camera_clip(
+                imgs_per_cam[cam_idx],
+                cam_idx,
+                global_frame_idxs=global_frame_idxs,
+            )
             cam_outputs['losses_dict'] = self.criterion.get_criterion(cam_idx).losses_dict
             outputs_per_cam[cam_idx] = cam_outputs
 

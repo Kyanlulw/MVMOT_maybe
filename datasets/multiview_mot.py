@@ -75,6 +75,8 @@ class MultiViewMOTDetection:
         self.scenes = []  # List of scene configs
         self.frame_index = []  # List of (scene_idx, frame_start_idx)
         self.video_dict = {}
+        self.scene_frame_offsets = []  # Global frame offset per scene
+        self._next_global_frame_offset = 0
 
         self._parse_data_file(data_txt_path, seqs_folder)
 
@@ -139,7 +141,6 @@ class MultiViewMOTDetection:
         with open(json_path, 'r') as f:
             data = json.load(f)
 
-        frame_counter = 0
         for scene_cfg in data['scenes']:
             scene_name = scene_cfg['name']
             cameras = scene_cfg['cameras']
@@ -199,6 +200,8 @@ class MultiViewMOTDetection:
 
             scene_idx = len(self.scenes)
             self.scenes.append(scene)
+            self.scene_frame_offsets.append(self._next_global_frame_offset)
+            self._next_global_frame_offset += scene['num_frames']
 
             # Register video
             video_name = osp.join(seqs_folder, scene_name)
@@ -279,6 +282,8 @@ class MultiViewMOTDetection:
 
             scene_idx = len(self.scenes)
             self.scenes.append(scene)
+            self.scene_frame_offsets.append(self._next_global_frame_offset)
+            self._next_global_frame_offset += scene['num_frames']
 
             video_name = osp.join(seqs_folder, scene_name)
             if video_name not in self.video_dict:
@@ -386,6 +391,9 @@ class MultiViewMOTDetection:
         sample_start, sample_end, sample_interval = self._get_sample_range(base_frame_idx)
         # Clamp to available frames
         sample_end = min(sample_end, scene['num_frames'])
+        sampled_frame_indices = list(range(sample_start, sample_end, sample_interval))
+        scene_global_offset = self.scene_frame_offsets[scene_idx]
+        global_frame_idxs = [scene_global_offset + frame_idx for frame_idx in sampled_frame_indices]
 
         data = {}
 
@@ -397,7 +405,7 @@ class MultiViewMOTDetection:
             images_for_view = []
             targets_for_view = []
 
-            for frame_idx in range(sample_start, sample_end, sample_interval):
+            for frame_idx in sampled_frame_indices:
                 img, targets = self._load_single_frame(scene_idx, cam_name, frame_idx)
                 images_for_view.append(img)
                 targets_for_view.append(targets)
@@ -422,6 +430,7 @@ class MultiViewMOTDetection:
         # Canonical keys consumed by MultiviewMOTR.forward.
         data['imgs'] = imgs_multiview
         data['gt_instances'] = gt_instances_multiview
+        data['global_frame_idxs'] = global_frame_idxs
 
         # Keep explicit single-view aliases for optional debugging/visualization.
         data['imgs_single_view'] = imgs_multiview[0]
@@ -435,7 +444,7 @@ class MultiViewMOTDetection:
             data['ori_img'] = []
             for v in range(len(cameras)):
                 view_ori = []
-                for frame_idx in range(sample_start, sample_end, sample_interval):
+                for frame_idx in sampled_frame_indices:
                     img, _ = self._load_single_frame(scene_idx, cameras[v], frame_idx)
                     view_ori.append(np.array(img))
                 data['ori_img'].append(view_ori)
