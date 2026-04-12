@@ -33,18 +33,18 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 
 from models.structures import Instances, Boxes, pairwise_iou, matched_boxlist_iou
 
-from .backbone import build_backbone
-from .matcher import build_matcher
-from .deformable_transformer_plus import build_deforamble_transformer
-from .qim import build as build_query_interaction_layer
-from .memory_bank import build_memory_bank
-from .temp import QueueMemoryBank
-from .deformable_detr import SetCriterion, MLP
-from .segmentation import sigmoid_focal_loss
-from .reid_query import ReIDQueryModule, build_reid_query_vit_model
+from ..backbone import build_backbone
+from ..matcher import build_matcher
+from ..deformable_transformer_plus import build_deforamble_transformer
+from ..qim import build as build_query_interaction_layer
+from ..memory_bank import build_memory_bank
+from ..temp import QueueMemoryBank
+from ..deformable_detr import SetCriterion, MLP
+from ..segmentation import sigmoid_focal_loss
+from ..reid_query import ReIDQueryModule, build_reid_query_vit_model
 
 # Re-use ClipMatcher unchanged — it is instantiated once per camera during training.
-from .motr import ClipMatcher, TrackerPostProcess, RuntimeTrackerBase, _get_clones
+from ..motr import ClipMatcher, TrackerPostProcess, RuntimeTrackerBase, _get_clones
 
 
 # ---------------------------------------------------------------------------
