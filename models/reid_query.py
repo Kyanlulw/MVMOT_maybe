@@ -434,6 +434,7 @@ class ReIDQueryModule(nn.Module):
         tau1            : maximum queue depth (= QueueMemoryBank.maxlen)
         tau2            : window length fed to the transformer  (tau2 <= tau1)
         label_smoothing : for cross-entropy ID loss
+        temporal_decay_alpha : if <1.0, apply exponential decay to older tokens in the window -> older frames contribute less when feed into the encoder.
 
     Integration in MultiviewMOTR._post_process_single_image,
     after assigning output_embedding and BEFORE match_for_single_frame:
@@ -459,12 +460,18 @@ class ReIDQueryModule(nn.Module):
         num_ids        : int,
         tau1           : int   = 10,
         tau2           : int   = 4,
+        temporal_decay_alpha: float = 1.0,
         label_smoothing: float = 0.1,
     ):
         super().__init__()
         assert tau2 <= tau1, f"tau2 ({tau2}) must be <= tau1 ({tau1})"
+        if temporal_decay_alpha < 0.0 or temporal_decay_alpha > 1.0:
+            raise ValueError(
+                f"temporal_decay_alpha must be in [0, 1], got {temporal_decay_alpha}"
+            )
         self.tau2      = tau2
         self.track_dim = track_dim
+        self.temporal_decay_alpha = float(temporal_decay_alpha)
 
         # Frame Embedding: uses track_dim because it is added BEFORE projection
         # into vit_dim (we want FE to encode position in the track space)
@@ -554,6 +561,25 @@ class ReIDQueryModule(nn.Module):
         frame_indices   [pad_offset:] = fidxs
         embeddings      [pad_offset:] = embeds
         key_padding_mask[pad_offset:] = False                   # mark as valid
+
+        if self.temporal_decay_alpha < 1.0:
+            valid_count = T_actual
+            if valid_count > 1:
+                decay_base = torch.tensor(
+                    self.temporal_decay_alpha,
+                    dtype=embeddings.dtype,
+                    device=device,
+                )
+                # Oldest valid token gets alpha^(valid_count-1), newest gets alpha^0.
+                exponents = torch.arange(
+                    valid_count - 1,
+                    -1,
+                    -1,
+                    dtype=embeddings.dtype,
+                    device=device,
+                )
+                decay = torch.pow(decay_base, exponents).unsqueeze(-1)
+                embeddings[pad_offset:] = embeddings[pad_offset:] * decay
 
         return frame_indices, embeddings, key_padding_mask
 

@@ -194,6 +194,7 @@ class MultiviewMOTR(nn.Module):
         reid_num_layers: int = 2,
         reid_num_heads: int = 8,
         reid_dropout: float = 0.1,
+        reid_temporal_decay_alpha: float = 1.0,
     ):
         super().__init__()
         self.num_cams = num_cams
@@ -320,6 +321,7 @@ class MultiviewMOTR(nn.Module):
                 num_ids=self.reid_num_ids,
                 tau1=max(1, int(reid_tau1)),
                 tau2=max(1, int(reid_tau2)),
+                temporal_decay_alpha=float(reid_temporal_decay_alpha),
                 label_smoothing=float(reid_label_smoothing),
             )
             self.reid_queue_bank = QueueMemoryBank(
@@ -820,6 +822,7 @@ def build(args):
         reid_num_layers=getattr(args, 'reid_num_layers', 2),
         reid_num_heads=getattr(args, 'reid_num_heads', 8),
         reid_dropout=getattr(args, 'reid_dropout', 0.1),
+        reid_temporal_decay_alpha=getattr(args, 'reid_temporal_decay_alpha', 1.0),
     )
     model.to(device)
 

@@ -60,6 +60,8 @@ def get_args_parser():
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--lr_scheduler', default='step', type=str, choices=['step', 'cosine'])
+    parser.add_argument('--lr_scheduler_interval', default='epoch', type=str, choices=['epoch', 'step'],
+                        help='Update LR scheduler every epoch or every optimizer step')
     parser.add_argument('--cosine_start_epoch', default=0, type=int,
                         help='For cosine scheduler: keep LR flat until this epoch, then start cosine decay')
     parser.add_argument('--save_period', default=50, type=int)
@@ -222,6 +224,8 @@ def get_args_parser():
                         help='Attention heads in lightweight ReID backbone')
     parser.add_argument('--reid_dropout', type=float, default=0.1,
                         help='Dropout in lightweight ReID backbone')
+    parser.add_argument('--reid_temporal_decay_alpha', type=float, default=1.0,
+                        help='Temporal decay alpha in [0,1] for ReID queue tokens; 1.0 disables decay, 0.5 emphasizes current frame')
 
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
 
@@ -347,15 +351,24 @@ def main(args):
     else:
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                       weight_decay=args.weight_decay)
+
+    scheduler_step_per_iter = args.lr_scheduler_interval == 'step'
+    cosine_start_epoch = max(0, args.cosine_start_epoch)
     if args.lr_scheduler == 'cosine':
-        cosine_t_max = max(1, args.epochs - args.cosine_start_epoch)
+        if scheduler_step_per_iter:
+            cosine_t_max = max(1, (args.epochs - cosine_start_epoch) * len(data_loader_train))
+        else:
+            cosine_t_max = max(1, args.epochs - cosine_start_epoch)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=cosine_t_max,
             eta_min=0.0,
         )
     else:
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+        step_size = args.lr_drop
+        if scheduler_step_per_iter:
+            step_size = max(1, args.lr_drop * len(data_loader_train))
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
@@ -401,7 +414,10 @@ def main(args):
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop and args.lr_scheduler == 'step':
                 print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
-                lr_scheduler.step_size = args.lr_drop
+                if scheduler_step_per_iter:
+                    lr_scheduler.step_size = max(1, args.lr_drop * len(data_loader_train))
+                else:
+                    lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
@@ -429,12 +445,17 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_func(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-        if args.lr_scheduler == 'cosine':
-            if (epoch + 1) >= args.cosine_start_epoch:
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
+            lr_scheduler=lr_scheduler,
+            scheduler_step_per_iter=scheduler_step_per_iter,
+            scheduler_start_epoch=cosine_start_epoch if args.lr_scheduler == 'cosine' else 0,
+        )
+        if not scheduler_step_per_iter:
+            if args.lr_scheduler == 'cosine':
+                if (epoch + 1) >= cosine_start_epoch:
+                    lr_scheduler.step()
+            else:
                 lr_scheduler.step()
-        else:
-            lr_scheduler.step()
 
         # Log train stats to wandb
         if args.wandb and HAS_WANDB and utils.is_main_process():

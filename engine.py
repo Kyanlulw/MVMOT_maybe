@@ -38,7 +38,9 @@ from datasets.data_prefetcher import data_prefetcher, data_dict_to_cuda
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0,
+                    lr_scheduler=None, scheduler_step_per_iter: bool = False,
+                    scheduler_start_epoch: int = 0):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -83,6 +85,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
+        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+            lr_scheduler.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
@@ -109,7 +113,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0,
+                    lr_scheduler=None, scheduler_step_per_iter: bool = False,
+                    scheduler_start_epoch: int = 0):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -154,6 +160,8 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
+        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+            lr_scheduler.step()
 
         # metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
@@ -270,7 +278,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
 def train_one_epoch_multiview_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                                   device: torch.device, epoch: int, max_norm: float = 0):
+                                   device: torch.device, epoch: int, max_norm: float = 0,
+                                   lr_scheduler=None, scheduler_step_per_iter: bool = False,
+                                   scheduler_start_epoch: int = 0):
     """
     Training loop for multi-view MOT.
     
@@ -317,6 +327,8 @@ def train_one_epoch_multiview_mot(model: torch.nn.Module, criterion: torch.nn.Mo
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
+        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+            lr_scheduler.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
