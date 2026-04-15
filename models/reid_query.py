@@ -379,8 +379,23 @@ class ReIDOutputLayer(nn.Module):
                         }
                         or None at inference.
         """
-        # BN-normalised feature — used for CE loss and downstream embedding
-        feat = self.bottleneck(F_id)               # [N, vit_dim]
+        # BN-normalised feature — used for CE loss and downstream embedding.
+        # BatchNorm1d in training mode requires N > 1. With many camera views,
+        # some frames can produce a singleton alive-track batch (N == 1).
+        # In that case, fall back to running-stat normalization to avoid crash.
+        if self.training and F_id.shape[0] <= 1:
+            feat = F.batch_norm(
+                F_id,
+                self.bottleneck.running_mean,
+                self.bottleneck.running_var,
+                self.bottleneck.weight,
+                self.bottleneck.bias,
+                training=False,
+                momentum=self.bottleneck.momentum,
+                eps=self.bottleneck.eps,
+            )
+        else:
+            feat = self.bottleneck(F_id)           # [N, vit_dim]
 
         if self.training and target_ids is not None:
             # --- CE loss (classification) ---
