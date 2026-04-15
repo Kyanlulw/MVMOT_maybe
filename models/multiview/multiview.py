@@ -293,6 +293,7 @@ class MultiviewMOTR(nn.Module):
 
         self.use_reid_query = bool(use_reid_query)
         self.reid_num_ids = max(1, int(reid_num_ids))
+        self.tmp_window_tau1 = max(1, int(reid_tau1))
         self._reid_obj_to_cls: List[Dict[int, int]] = [dict() for _ in range(num_cams)]
         self.reid_queue_bank: Optional[QueueMemoryBank] = None
         self.reid_module: Optional[ReIDQueryModule] = None
@@ -339,6 +340,12 @@ class MultiviewMOTR(nn.Module):
         self._cross_view_global_tracks: Dict[int, List[Tuple[int, int]]] = {}
         self._cross_view_global_proto: Dict[int, Tensor] = {}
         self._next_cross_view_global_id: int = 0
+        # TMP entry state per (camera, global_id): last seen frame, active/inactive, current local id.
+        self._tmp_track_state: Dict[Tuple[int, int], Dict[str, int]] = {}
+
+        # Paper-aligned behavior: keep unmatched queries inactive within tau1 before drop.
+        for tb in self.track_bases:
+            tb.miss_tolerance = self.tmp_window_tau1
 
     # ------------------------------------------------------------------
     # Per-camera track instance management
@@ -383,6 +390,7 @@ class MultiviewMOTR(nn.Module):
             self._cross_view_global_tracks.clear()
             self._cross_view_global_proto.clear()
             self._next_cross_view_global_id = 0
+            self._tmp_track_state.clear()
         else:
             self._queue_frame_idx[cam_idx] = 0
             if self.track_query_queue is not None:
@@ -402,6 +410,10 @@ class MultiviewMOTR(nn.Module):
                     if len(self._cross_view_global_tracks[gid]) == 0:
                         self._cross_view_global_tracks.pop(gid, None)
                         self._cross_view_global_proto.pop(gid, None)
+
+            stale_tmp = [key for key in self._tmp_track_state if key[0] == cam_idx]
+            for key in stale_tmp:
+                self._tmp_track_state.pop(key, None)
 
     def _build_reid_target_ids(self, cam_idx: int, track_instances: Instances) -> Optional[Tensor]:
         alive_mask = track_instances.obj_idxes >= 0
@@ -443,6 +455,104 @@ class MultiviewMOTR(nn.Module):
         else:
             self.track_bases[cam_idx].clear()
             self._reset_track_query_queue(cam_idx)
+
+    def _prune_inference_tmp(self, current_frame_by_cam: Dict[int, int]):
+        """Prune stale TMP/reid queue entries older than tau1 frames."""
+        tau1 = self.tmp_window_tau1
+
+        for cam_idx, current_frame in current_frame_by_cam.items():
+            if self.reid_queue_bank is not None:
+                for track_id, track_queue in list(self.reid_queue_bank.get_all_queues(cam_idx).items()):
+                    if len(track_queue) == 0:
+                        self.reid_queue_bank.remove_track(cam_idx, track_id)
+                        continue
+                    last_frame = int(track_queue.snapshots[-1].frame_id)
+                    if (current_frame - last_frame) > tau1:
+                        self.reid_queue_bank.remove_track(cam_idx, track_id)
+
+            for key, state in list(self._tmp_track_state.items()):
+                key_cam, gid = key
+                if key_cam != cam_idx:
+                    continue
+                if (current_frame - int(state['last_seen'])) <= tau1:
+                    continue
+
+                # Discard TMP entry when undetected for > tau1.
+                self._tmp_track_state.pop(key, None)
+
+                remove_local_keys = [
+                    local_key
+                    for local_key, mapped_gid in self._cross_view_local_to_global.items()
+                    if local_key[0] == cam_idx and mapped_gid == gid
+                ]
+                for local_key in remove_local_keys:
+                    self._cross_view_local_to_global.pop(local_key, None)
+
+                if gid in self._cross_view_global_tracks:
+                    self._cross_view_global_tracks[gid] = [
+                        pair for pair in self._cross_view_global_tracks[gid] if pair[0] != cam_idx
+                    ]
+                    if len(self._cross_view_global_tracks[gid]) == 0:
+                        self._cross_view_global_tracks.pop(gid, None)
+                        self._cross_view_global_proto.pop(gid, None)
+
+    def _update_tmp_track_state(
+        self,
+        track_instances_by_cam: Dict[int, Instances],
+        cross_view_ids: Dict[int, Tensor],
+        current_frame_by_cam: Dict[int, int],
+    ):
+        """Update active/inactive TMP states and handle reactivation/new entries."""
+        for cam_idx, track_instances in track_instances_by_cam.items():
+            current_frame = current_frame_by_cam[cam_idx]
+            observed_keys = set()
+
+            if len(track_instances) > 0:
+                valid = track_instances.obj_idxes >= 0
+                if track_instances.has('scores'):
+                    valid = valid & (track_instances.scores >= self.track_bases[cam_idx].filter_score_thresh)
+                valid_indices = valid.nonzero(as_tuple=False).squeeze(1)
+
+                for idx in valid_indices.tolist():
+                    gid = int(cross_view_ids[cam_idx][idx].item())
+                    if gid < 0:
+                        continue
+
+                    local_id = int(track_instances.obj_idxes[idx].item())
+                    key = (cam_idx, gid)
+                    prev_state = self._tmp_track_state.get(key)
+                    if prev_state is None:
+                        # New object: create a TMP entry.
+                        self._tmp_track_state[key] = {
+                            'last_seen': current_frame,
+                            'active': 1,
+                            'local_id': local_id,
+                        }
+                    else:
+                        # Reactivation (if was inactive) or normal active update.
+                        prev_state['last_seen'] = current_frame
+                        prev_state['active'] = 1
+                        prev_state['local_id'] = local_id
+
+                    observed_keys.add(key)
+
+            # Undetected entries remain in TMP as inactive if still inside tau1.
+            for key, state in self._tmp_track_state.items():
+                if key[0] != cam_idx:
+                    continue
+                if key in observed_keys:
+                    continue
+                state['active'] = 0
+
+    def _export_tmp_status(self) -> Dict[str, Dict[str, int]]:
+        status = {}
+        for (cam_idx, gid), state in self._tmp_track_state.items():
+            status[f"cam{cam_idx}_gid{gid}"] = {
+                'active': int(state.get('active', 0)),
+                'last_seen': int(state.get('last_seen', -1)),
+                'local_id': int(state.get('local_id', -1)),
+            }
+        return status
 
     def _associate_cross_view_reid(self, track_instances_by_cam: Dict[int, Instances]) -> Dict[int, Tensor]:
         """Assign global IDs across cameras from per-track ReID embeddings."""
@@ -764,7 +874,15 @@ class MultiviewMOTR(nn.Module):
         track_instances = res['track_instances']
         track_instances = self.post_process(track_instances, ori_img_size)
 
+        current_frame_by_cam = {cam_idx: max(0, self._queue_frame_idx[cam_idx] - 1)}
+        self._prune_inference_tmp(current_frame_by_cam)
+
         cross_view_ids = self._associate_cross_view_reid({cam_idx: track_instances})
+        self._update_tmp_track_state(
+            {cam_idx: track_instances},
+            cross_view_ids,
+            current_frame_by_cam,
+        )
         track_instances.cross_view_ids = cross_view_ids[cam_idx]
 
         ret = {'track_instances': track_instances}
@@ -774,6 +892,7 @@ class MultiviewMOTR(nn.Module):
             scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
             ret['ref_pts'] = ref_pts * scale_fct[None]
         ret['cross_view_matches'] = self._export_cross_view_matches()
+        ret['tmp_status'] = self._export_tmp_status()
         return ret
 
     @torch.no_grad()
@@ -795,6 +914,7 @@ class MultiviewMOTR(nn.Module):
 
         views = []
         track_instances_by_cam: Dict[int, Instances] = {}
+        current_frame_by_cam: Dict[int, int] = {}
 
         for cam_idx in range(self.num_cams):
             img = imgs[cam_idx]
@@ -811,6 +931,7 @@ class MultiviewMOTR(nn.Module):
 
             post_track_instances = self.post_process(res['track_instances'], ori_img_sizes[cam_idx])
             track_instances_by_cam[cam_idx] = post_track_instances
+            current_frame_by_cam[cam_idx] = max(0, self._queue_frame_idx[cam_idx] - 1)
 
             view_out = {'track_instances': post_track_instances}
             if 'ref_pts' in res:
@@ -820,13 +941,16 @@ class MultiviewMOTR(nn.Module):
                 view_out['ref_pts'] = ref_pts * scale_fct[None]
             views.append(view_out)
 
+        self._prune_inference_tmp(current_frame_by_cam)
         cross_view_ids = self._associate_cross_view_reid(track_instances_by_cam)
+        self._update_tmp_track_state(track_instances_by_cam, cross_view_ids, current_frame_by_cam)
         for cam_idx in range(self.num_cams):
             views[cam_idx]['track_instances'].cross_view_ids = cross_view_ids[cam_idx]
 
         return {
             'views': views,
             'cross_view_matches': self._export_cross_view_matches(),
+            'tmp_status': self._export_tmp_status(),
         }
 
     def forward(self, data: dict) -> dict:
