@@ -195,6 +195,8 @@ class MultiviewMOTR(nn.Module):
         reid_num_heads: int = 8,
         reid_dropout: float = 0.1,
         reid_temporal_decay_alpha: float = 1.0,
+        cross_view_reid_match_thresh: float = 0.7,
+        cross_view_reid_momentum: float = 0.9,
     ):
         super().__init__()
         self.num_cams = num_cams
@@ -330,6 +332,14 @@ class MultiviewMOTR(nn.Module):
                 score_thresh=float(track_query_queue_score_thresh),
             )
 
+        # Cross-view ReID state (inference-time global identity association).
+        self.cross_view_reid_match_thresh = float(cross_view_reid_match_thresh)
+        self.cross_view_reid_momentum = float(cross_view_reid_momentum)
+        self._cross_view_local_to_global: Dict[Tuple[int, int], int] = {}
+        self._cross_view_global_tracks: Dict[int, List[Tuple[int, int]]] = {}
+        self._cross_view_global_proto: Dict[int, Tensor] = {}
+        self._next_cross_view_global_id: int = 0
+
     # ------------------------------------------------------------------
     # Per-camera track instance management
     # ------------------------------------------------------------------
@@ -369,6 +379,10 @@ class MultiviewMOTR(nn.Module):
                 self.reid_queue_bank.clear()
             if self.use_reid_query:
                 self._reid_obj_to_cls = [dict() for _ in range(self.num_cams)]
+            self._cross_view_local_to_global.clear()
+            self._cross_view_global_tracks.clear()
+            self._cross_view_global_proto.clear()
+            self._next_cross_view_global_id = 0
         else:
             self._queue_frame_idx[cam_idx] = 0
             if self.track_query_queue is not None:
@@ -377,6 +391,17 @@ class MultiviewMOTR(nn.Module):
                 self.reid_queue_bank.clear(cam_idx=cam_idx)
             if self.use_reid_query:
                 self._reid_obj_to_cls[cam_idx].clear()
+
+            remove_keys = [key for key in self._cross_view_local_to_global if key[0] == cam_idx]
+            for key in remove_keys:
+                gid = self._cross_view_local_to_global.pop(key)
+                if gid in self._cross_view_global_tracks:
+                    self._cross_view_global_tracks[gid] = [
+                        pair for pair in self._cross_view_global_tracks[gid] if pair != key
+                    ]
+                    if len(self._cross_view_global_tracks[gid]) == 0:
+                        self._cross_view_global_tracks.pop(gid, None)
+                        self._cross_view_global_proto.pop(gid, None)
 
     def _build_reid_target_ids(self, cam_idx: int, track_instances: Instances) -> Optional[Tensor]:
         alive_mask = track_instances.obj_idxes >= 0
@@ -418,6 +443,77 @@ class MultiviewMOTR(nn.Module):
         else:
             self.track_bases[cam_idx].clear()
             self._reset_track_query_queue(cam_idx)
+
+    def _associate_cross_view_reid(self, track_instances_by_cam: Dict[int, Instances]) -> Dict[int, Tensor]:
+        """Assign global IDs across cameras from per-track ReID embeddings."""
+        cross_view_ids: Dict[int, Tensor] = {}
+        used_gids_per_cam: Dict[int, set] = {}
+
+        for cam_idx, track_instances in track_instances_by_cam.items():
+            device = track_instances.obj_idxes.device
+            cross_view_ids[cam_idx] = torch.full(
+                (len(track_instances),), -1, dtype=torch.long, device=device
+            )
+            used_gids_per_cam[cam_idx] = set()
+
+            if len(track_instances) == 0 or not track_instances.has('output_embedding'):
+                continue
+
+            valid = track_instances.obj_idxes >= 0
+            if track_instances.has('scores'):
+                valid = valid & (track_instances.scores >= self.track_bases[cam_idx].filter_score_thresh)
+            valid_indices = valid.nonzero(as_tuple=False).squeeze(1)
+
+            for track_idx in valid_indices.tolist():
+                local_id = int(track_instances.obj_idxes[track_idx].item())
+                local_key = (cam_idx, local_id)
+
+                emb = track_instances.output_embedding[track_idx].detach()
+                if emb.ndim != 1:
+                    emb = emb.flatten()
+                emb = F.normalize(emb, dim=0)
+
+                if local_key in self._cross_view_local_to_global:
+                    gid = self._cross_view_local_to_global[local_key]
+                else:
+                    gid = -1
+                    best_sim = -1.0
+                    for cand_gid, proto in self._cross_view_global_proto.items():
+                        if cand_gid in used_gids_per_cam[cam_idx]:
+                            continue
+                        sim = torch.dot(emb, proto).item()
+                        if sim > best_sim:
+                            best_sim = sim
+                            gid = cand_gid
+
+                    if gid >= 0 and best_sim >= self.cross_view_reid_match_thresh:
+                        self._cross_view_local_to_global[local_key] = gid
+                        self._cross_view_global_tracks.setdefault(gid, []).append(local_key)
+                    else:
+                        gid = self._next_cross_view_global_id
+                        self._next_cross_view_global_id += 1
+                        self._cross_view_local_to_global[local_key] = gid
+                        self._cross_view_global_tracks[gid] = [local_key]
+                        self._cross_view_global_proto[gid] = emb
+
+                if gid not in self._cross_view_global_proto:
+                    self._cross_view_global_proto[gid] = emb
+                else:
+                    m = self.cross_view_reid_momentum
+                    proto = self._cross_view_global_proto[gid]
+                    self._cross_view_global_proto[gid] = F.normalize(m * proto + (1.0 - m) * emb, dim=0)
+
+                used_gids_per_cam[cam_idx].add(gid)
+                cross_view_ids[cam_idx][track_idx] = gid
+
+        return cross_view_ids
+
+    def _export_cross_view_matches(self) -> Dict[int, List[Tuple[int, int]]]:
+        matches: Dict[int, List[Tuple[int, int]]] = {}
+        for gid, pairs in self._cross_view_global_tracks.items():
+            unique_pairs = sorted(set((int(c), int(l)) for c, l in pairs))
+            matches[int(gid)] = unique_pairs
+        return matches
 
     # ------------------------------------------------------------------
     # Core single-image forward (reused for every camera/frame)
@@ -667,13 +763,71 @@ class MultiviewMOTR(nn.Module):
 
         track_instances = res['track_instances']
         track_instances = self.post_process(track_instances, ori_img_size)
+
+        cross_view_ids = self._associate_cross_view_reid({cam_idx: track_instances})
+        track_instances.cross_view_ids = cross_view_ids[cam_idx]
+
         ret = {'track_instances': track_instances}
         if 'ref_pts' in res:
             ref_pts = res['ref_pts']
             img_h, img_w = ori_img_size
             scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
             ret['ref_pts'] = ref_pts * scale_fct[None]
+        ret['cross_view_matches'] = self._export_cross_view_matches()
         return ret
+
+    @torch.no_grad()
+    def inference_single_image_multiview(
+        self,
+        imgs: List[Tensor],
+        ori_img_sizes: List[Tuple[int, int]],
+        track_instances_list: Optional[List[Optional[Instances]]] = None,
+    ) -> dict:
+        """Run synchronized inference for all cameras and return cross-view ReID matches."""
+        assert len(imgs) == self.num_cams, f"Expected {self.num_cams} images, got {len(imgs)}"
+        assert len(ori_img_sizes) == self.num_cams, f"Expected {self.num_cams} image sizes, got {len(ori_img_sizes)}"
+
+        if track_instances_list is None:
+            track_instances_list = [None] * self.num_cams
+        else:
+            assert len(track_instances_list) == self.num_cams, \
+                f"Expected {self.num_cams} track states, got {len(track_instances_list)}"
+
+        views = []
+        track_instances_by_cam: Dict[int, Instances] = {}
+
+        for cam_idx in range(self.num_cams):
+            img = imgs[cam_idx]
+            if not isinstance(img, NestedTensor):
+                img = nested_tensor_from_tensor_list(img)
+
+            track_instances = track_instances_list[cam_idx]
+            if track_instances is None:
+                self._reset_track_query_queue(cam_idx)
+                track_instances = self._generate_empty_tracks()
+
+            res = self._forward_single_image(img, track_instances)
+            res = self._post_process_single_image(res, track_instances, False, cam_idx)
+
+            post_track_instances = self.post_process(res['track_instances'], ori_img_sizes[cam_idx])
+            track_instances_by_cam[cam_idx] = post_track_instances
+
+            view_out = {'track_instances': post_track_instances}
+            if 'ref_pts' in res:
+                ref_pts = res['ref_pts']
+                img_h, img_w = ori_img_sizes[cam_idx]
+                scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
+                view_out['ref_pts'] = ref_pts * scale_fct[None]
+            views.append(view_out)
+
+        cross_view_ids = self._associate_cross_view_reid(track_instances_by_cam)
+        for cam_idx in range(self.num_cams):
+            views[cam_idx]['track_instances'].cross_view_ids = cross_view_ids[cam_idx]
+
+        return {
+            'views': views,
+            'cross_view_matches': self._export_cross_view_matches(),
+        }
 
     def forward(self, data: dict) -> dict:
         """
@@ -823,6 +977,8 @@ def build(args):
         reid_num_heads=getattr(args, 'reid_num_heads', 8),
         reid_dropout=getattr(args, 'reid_dropout', 0.1),
         reid_temporal_decay_alpha=getattr(args, 'reid_temporal_decay_alpha', 1.0),
+        cross_view_reid_match_thresh=getattr(args, 'cross_view_reid_match_thresh', 0.7),
+        cross_view_reid_momentum=getattr(args, 'cross_view_reid_momentum', 0.9),
     )
     model.to(device)
 
