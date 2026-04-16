@@ -7,6 +7,7 @@
 # ------------------------------------------------------------------------
 
 import argparse
+import math
 import os
 import os.path as osp
 import json
@@ -36,7 +37,42 @@ def make_inference_transforms():
     ])
 
 
-def load_multiview_frames(scene_dir, camera_names, frame_idx):
+def discover_camera_names(scene_dir):
+    """Discover camera folders that contain an images directory with frames."""
+    cameras = []
+    for name in sorted(os.listdir(scene_dir)):
+        cam_dir = osp.join(scene_dir, name)
+        img_dir = osp.join(cam_dir, 'images')
+        if not osp.isdir(cam_dir) or not osp.isdir(img_dir):
+            continue
+        has_frames = any(
+            f.lower().endswith(('.jpg', '.png', '.jpeg'))
+            for f in os.listdir(img_dir)
+        )
+        if has_frames:
+            cameras.append(name)
+    return cameras
+
+
+def collect_frame_files(scene_dir, camera_names):
+    """Return sorted frame-file lists per camera and synchronized frame count."""
+    frame_files_by_cam = {}
+    min_frames = None
+    for cam in camera_names:
+        img_dir = osp.join(scene_dir, cam, 'images')
+        img_files = sorted([
+            f for f in os.listdir(img_dir)
+            if f.lower().endswith(('.jpg', '.png', '.jpeg'))
+        ])
+        frame_files_by_cam[cam] = img_files
+        if min_frames is None:
+            min_frames = len(img_files)
+        else:
+            min_frames = min(min_frames, len(img_files))
+    return frame_files_by_cam, (0 if min_frames is None else min_frames)
+
+
+def load_multiview_frames(scene_dir, camera_names, frame_files_by_cam, frame_idx):
     """
     Load synchronized frames from multiple camera views.
     
@@ -52,10 +88,7 @@ def load_multiview_frames(scene_dir, camera_names, frame_idx):
     ori_sizes = []
     for cam in camera_names:
         img_dir = osp.join(scene_dir, cam, 'images')
-        img_files = sorted([
-            f for f in os.listdir(img_dir)
-            if f.endswith(('.jpg', '.png', '.jpeg'))
-        ])
+        img_files = frame_files_by_cam[cam]
         if frame_idx < len(img_files):
             img_path = osp.join(img_dir, img_files[frame_idx])
             img = Image.open(img_path)
@@ -68,6 +101,7 @@ def draw_tracks_multiview(
     images, results, camera_names,
     global_id_mapping=None,
     color_map=None,
+    score_thresh=0.5,
 ):
     """
     Draw tracking results on multi-view images.
@@ -82,6 +116,15 @@ def draw_tracks_multiview(
     if color_map is None:
         color_map = {}
 
+    # Fallback table: (view_idx, local_id) -> global_id.
+    # Primary source for alignment should be per-track cross_view_ids.
+    local_to_global = {}
+    if global_id_mapping:
+        for gid, locals_list in global_id_mapping.items():
+            gid_int = int(gid)
+            for vid, lid in locals_list:
+                local_to_global[(int(vid), int(lid))] = gid_int
+
     output_images = []
     for v, cam_name in enumerate(camera_names):
         img = images[v].copy()
@@ -92,23 +135,27 @@ def draw_tracks_multiview(
             boxes = track_instances.boxes.cpu().numpy() if hasattr(track_instances, 'boxes') else []
             scores = track_instances.scores.cpu().numpy() if hasattr(track_instances, 'scores') else []
             obj_ids = track_instances.obj_idxes.cpu().numpy() if hasattr(track_instances, 'obj_idxes') else []
+            cross_view_ids = (
+                track_instances.cross_view_ids.cpu().numpy()
+                if hasattr(track_instances, 'cross_view_ids')
+                else None
+            )
 
             for i in range(len(boxes)):
-                if scores[i] < 0.5:
+                if scores[i] < score_thresh:
                     continue
 
                 obj_id = int(obj_ids[i])
                 if obj_id < 0:
                     continue
 
-                # Get global ID if available
+                # Prefer direct per-track cross-view assignment from model output,
+                # fallback to mapping lookup if not present.
                 global_id = -1
-                if global_id_mapping:
-                    for gid, locals_list in global_id_mapping.items():
-                        for vid, lid in locals_list:
-                            if vid == v and lid == obj_id:
-                                global_id = gid
-                                break
+                if cross_view_ids is not None and i < len(cross_view_ids):
+                    global_id = int(cross_view_ids[i])
+                if global_id < 0:
+                    global_id = int(local_to_global.get((v, obj_id), -1))
 
                 # Use global ID for color if available, else local ID
                 display_id = global_id if global_id >= 0 else obj_id
@@ -146,8 +193,8 @@ def main():
     parser = argparse.ArgumentParser('Multi-View MOTR Demo', parents=[get_args_parser()])
     parser.add_argument('--scene_dir', type=str, required=True,
                        help='Path to the scene directory with camera subdirectories')
-    parser.add_argument('--camera_names', type=str, nargs='+', default=['camera_0', 'camera_1'],
-                       help='Names of camera subdirectories')
+    parser.add_argument('--camera_names', type=str, nargs='*', default=None,
+                       help='Optional camera subdirectory names; if omitted, discover automatically')
     parser.add_argument('--output_video', type=str, default='multiview_output.mp4',
                        help='Output video path')
     parser.add_argument('--score_thresh', type=float, default=0.5,
@@ -157,7 +204,13 @@ def main():
     # Override some args for demo
     args.meta_arch = 'multiview_motr'
     args.dataset_file = 'e2e_mv_mot'
-    args.num_views = len(args.camera_names)
+    if args.camera_names is None or len(args.camera_names) == 0:
+        args.camera_names = discover_camera_names(args.scene_dir)
+    if len(args.camera_names) == 0:
+        raise ValueError(f"No camera folders with images found under: {args.scene_dir}")
+
+    args.num_cams = len(args.camera_names)
+    args.num_views = args.num_cams
 
     device = torch.device(args.device)
 
@@ -174,32 +227,38 @@ def main():
     # Setup transforms
     transforms = make_inference_transforms()
 
-    # Discover frames
-    first_cam = args.camera_names[0]
-    img_dir = osp.join(args.scene_dir, first_cam, 'images')
-    frame_files = sorted([
-        f for f in os.listdir(img_dir)
-        if f.endswith(('.jpg', '.png', '.jpeg'))
-    ])
-    num_frames = len(frame_files)
-    print(f"Found {num_frames} frames across {len(args.camera_names)} cameras")
+    # Discover synchronized frame count across all cameras.
+    frame_files_by_cam, num_frames = collect_frame_files(args.scene_dir, args.camera_names)
+    print(f"Found {num_frames} synchronized frames across {len(args.camera_names)} cameras")
+    for cam in args.camera_names:
+        print(f"  {cam}: {len(frame_files_by_cam[cam])} frames")
+
+    if num_frames == 0:
+        raise ValueError("No synchronized frames found across selected cameras.")
 
     # Setup video writer
-    sample_img = cv2.imread(osp.join(img_dir, frame_files[0]))
+    first_cam = args.camera_names[0]
+    first_img_path = osp.join(args.scene_dir, first_cam, 'images', frame_files_by_cam[first_cam][0])
+    sample_img = cv2.imread(first_img_path)
     h, w = sample_img.shape[:2]
-    # Create side-by-side layout
-    total_w = w * len(args.camera_names)
+    # Create a grid layout so many cameras (e.g., 7) remain visible.
+    num_cams = len(args.camera_names)
+    grid_cols = min(3, num_cams)
+    grid_rows = int(math.ceil(num_cams / grid_cols))
+    total_w = w * grid_cols
+    total_h = h * grid_rows
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_video = cv2.VideoWriter(args.output_video, fourcc, 30, (total_w, h))
+    out_video = cv2.VideoWriter(args.output_video, fourcc, 30, (total_w, total_h))
 
     # Run tracking
     track_instances_list = None
     color_map = {}
+    last_results = None
 
     for frame_idx in range(num_frames):
         # Load multi-view frames
         pil_images, ori_sizes = load_multiview_frames(
-            args.scene_dir, args.camera_names, frame_idx
+            args.scene_dir, args.camera_names, frame_files_by_cam, frame_idx
         )
 
         if len(pil_images) != len(args.camera_names):
@@ -216,10 +275,11 @@ def main():
         # Run inference
         with torch.no_grad():
             results = model.inference_single_image_multiview(
-                imgs=[img.unsqueeze(0).to(device) for img in transformed_imgs],
+                imgs=[[img.to(device)] for img in transformed_imgs],
                 ori_img_sizes=ori_sizes,
                 track_instances_list=track_instances_list,
             )
+        last_results = results
 
         # Update track instances for next frame
         track_instances_list = [
@@ -233,16 +293,20 @@ def main():
             np_images, results, args.camera_names,
             global_id_mapping=results.get('cross_view_matches'),
             color_map=color_map,
+            score_thresh=args.score_thresh,
         )
 
-        # Create side-by-side frame
-        # Resize all to same height
-        resized = []
-        for vis_img in vis_images:
+        # Create a fixed-size grid frame.
+        canvas = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+        for cam_i, vis_img in enumerate(vis_images):
             if vis_img.shape[0] != h or vis_img.shape[1] != w:
                 vis_img = cv2.resize(vis_img, (w, h))
-            resized.append(vis_img)
-        combined = np.concatenate(resized, axis=1)
+            row = cam_i // grid_cols
+            col = cam_i % grid_cols
+            y0, y1 = row * h, (row + 1) * h
+            x0, x1 = col * w, (col + 1) * w
+            canvas[y0:y1, x0:x1] = vis_img
+        combined = canvas
         out_video.write(combined)
 
         if frame_idx % 50 == 0:
@@ -252,7 +316,7 @@ def main():
     print(f"Output saved to {args.output_video}")
 
     # Print cross-view statistics
-    global_mapping = results.get('cross_view_matches', {})
+    global_mapping = {} if last_results is None else last_results.get('cross_view_matches', {})
     print(f"\nCross-view tracking summary:")
     print(f"  Global IDs assigned: {len(global_mapping)}")
     for gid, locals_list in global_mapping.items():

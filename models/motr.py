@@ -910,7 +910,12 @@ def build(args):
     query_interaction_layer = build_query_interaction_layer(args, args.query_interaction_layer, d_model, hidden_dim, d_model*2)
 
     img_matcher = build_matcher(args)
-    num_frames_per_batch = max(args.sampler_lengths)
+    sampler_lengths = getattr(args, 'sampler_lengths', None)
+    if sampler_lengths is None or len(sampler_lengths) == 0:
+        # Demo/inference often omits sampler config; default to one-frame setup.
+        num_frames_per_batch = 1
+    else:
+        num_frames_per_batch = max(sampler_lengths)
     weight_dict = {}
     for i in range(num_frames_per_batch):
         weight_dict.update({"frame_{}_loss_ce".format(i): args.cls_loss_coef,

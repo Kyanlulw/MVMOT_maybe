@@ -1021,7 +1021,12 @@ def build(args):
     )
 
     img_matcher = build_matcher(args)
-    num_frames_per_batch = max(args.sampler_lengths)
+    sampler_lengths = getattr(args, 'sampler_lengths', None)
+    if sampler_lengths is None or len(sampler_lengths) == 0:
+        # Demo/inference often omits sampler config; default to one-frame setup.
+        num_frames_per_batch = 1
+    else:
+        num_frames_per_batch = max(sampler_lengths)
 
     # Build per-frame weight dict (same structure as original MOTR)
     weight_dict = {}
