@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image
+from tqdm.auto import tqdm
 
 from main import get_args_parser
 from models import build_model
@@ -189,6 +190,80 @@ def draw_tracks_multiview(
     return output_images, color_map
 
 
+def create_video_writer(output_video, frame_size, fps=30):
+    """Create a VideoWriter with codec/container fallbacks."""
+    target = Path(output_video)
+    ext = target.suffix.lower()
+
+    candidates_by_ext = {
+        '.mp4': [('mp4v', '.mp4'), ('avc1', '.mp4'), ('H264', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')],
+        '.avi': [('XVID', '.avi'), ('MJPG', '.avi'), ('mp4v', '.avi')],
+        '.mkv': [('mp4v', '.mkv'), ('XVID', '.avi'), ('MJPG', '.avi')],
+        'default': [('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')],
+    }
+    candidates = candidates_by_ext.get(ext, candidates_by_ext['default'])
+
+    tried = []
+    seen = set()
+    for codec, out_ext in candidates:
+        out_path = str(target.with_suffix(out_ext))
+        key = (out_path, codec)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(out_path, fourcc, fps, frame_size)
+        if writer.isOpened():
+            return writer, out_path, codec
+
+        writer.release()
+        tried.append(f"{out_path} ({codec})")
+
+    tried_str = ', '.join(tried)
+    raise RuntimeError(
+        f"Could not create video writer for {output_video}. Tried: {tried_str}"
+    )
+
+
+def print_criterion_debug(model):
+    """Print uncertainty-related criterion weights for camera 0 when available."""
+    criterion = getattr(model, 'criterion', None)
+    if criterion is None:
+        print('Criterion debug: model has no criterion attached.')
+        return
+
+    cam_criterion = None
+    criteria = getattr(criterion, 'criteria', None)
+    if criteria is not None and len(criteria) > 0:
+        cam_criterion = criteria[0]
+    else:
+        cam_criterion = criterion
+
+    w1 = getattr(cam_criterion, 'w1', None)
+    w2 = getattr(cam_criterion, 'w2', None)
+
+    # Current codebase stores uncertainty terms as log variances.
+    if w1 is None:
+        w1 = getattr(cam_criterion, 'log_var_tracking', None)
+    if w2 is None:
+        w2 = getattr(cam_criterion, 'log_var_reid', None)
+
+    def _to_scalar(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return float(value.detach().cpu().item())
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    w1_val = _to_scalar(w1)
+    w2_val = _to_scalar(w2)
+    print(f'Criterion debug cam0: w1={w1_val}, w2={w2_val}')
+
+
 def main():
     parser = argparse.ArgumentParser('Multi-View MOTR Demo', parents=[get_args_parser()])
     parser.set_defaults(use_reid_query=True)
@@ -230,6 +305,8 @@ def main():
         model = load_model(model, args.resume)
         print(f"Loaded model from {args.resume}")
 
+    print_criterion_debug(model)
+
     # Setup transforms
     transforms = make_inference_transforms()
 
@@ -253,15 +330,22 @@ def main():
     grid_rows = int(math.ceil(num_cams / grid_cols))
     total_w = w * grid_cols
     total_h = h * grid_rows
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_video = cv2.VideoWriter(args.output_video, fourcc, 30, (total_w, total_h))
+    out_video, output_video_path, output_codec = create_video_writer(
+        args.output_video,
+        (total_w, total_h),
+        fps=30,
+    )
+    if output_video_path != args.output_video:
+        print(f"Requested output {args.output_video} not supported, using {output_video_path} ({output_codec}).")
+    else:
+        print(f"Using video codec {output_codec} for output {output_video_path}.")
 
     # Run tracking
     track_instances_list = None
     color_map = {}
     last_results = None
 
-    for frame_idx in range(num_frames):
+    for frame_idx in tqdm(range(num_frames), desc='Processing frames', unit='frame', dynamic_ncols=True):
         # Load multi-view frames
         pil_images, ori_sizes = load_multiview_frames(
             args.scene_dir, args.camera_names, frame_files_by_cam, frame_idx
@@ -315,11 +399,8 @@ def main():
         combined = canvas
         out_video.write(combined)
 
-        if frame_idx % 50 == 0:
-            print(f"Processed frame {frame_idx}/{num_frames}")
-
     out_video.release()
-    print(f"Output saved to {args.output_video}")
+    print(f"Output saved to {output_video_path}")
 
     # Print cross-view statistics
     global_mapping = {} if last_results is None else last_results.get('cross_view_matches', {})
