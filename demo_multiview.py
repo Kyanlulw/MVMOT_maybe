@@ -191,6 +191,7 @@ def draw_tracks_multiview(
 
 def main():
     parser = argparse.ArgumentParser('Multi-View MOTR Demo', parents=[get_args_parser()])
+    parser.set_defaults(use_reid_query=True)
     parser.add_argument('--scene_dir', type=str, required=True,
                        help='Path to the scene directory with camera subdirectories')
     parser.add_argument('--camera_names', type=str, nargs='*', default=None,
@@ -199,6 +200,8 @@ def main():
                        help='Output video path')
     parser.add_argument('--score_thresh', type=float, default=0.5,
                        help='Score threshold for visualization')
+    parser.add_argument('--no_use_reid_query', dest='use_reid_query', action='store_false',
+                       help='Disable ReID query branch during demo inference')
     args = parser.parse_args()
 
     # Override some args for demo
@@ -211,6 +214,9 @@ def main():
 
     args.num_cams = len(args.camera_names)
     args.num_views = args.num_cams
+
+    if not args.use_reid_query:
+        print('Warning: use_reid_query is disabled; cross-view ID alignment quality may drop.')
 
     device = torch.device(args.device)
 
