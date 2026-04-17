@@ -226,7 +226,7 @@ def get_args_parser():
                         help='Dropout in lightweight ReID backbone')
     parser.add_argument('--reid_temporal_decay_alpha', type=float, default=1.0,
                         help='Temporal decay alpha in [0,1] for ReID queue tokens; 1.0 disables decay, 0.5 emphasizes current frame')
-    parser.add_argument('--cross_view_reid_match_thresh', type=float, default=0.7,
+    parser.add_argument('--cross_view_reid_match_thresh', type=float, default=0.8,
                         help='Cosine similarity threshold for linking identities across cameras at inference')
     parser.add_argument('--cross_view_reid_momentum', type=float, default=0.9,
                         help='EMA momentum for cross-view ReID global prototype updates')

@@ -555,18 +555,20 @@ class MultiviewMOTR(nn.Module):
         return status
 
     def _associate_cross_view_reid(self, track_instances_by_cam: Dict[int, Instances]) -> Dict[int, Tensor]:
-        """Assign global IDs across cameras from per-track ReID embeddings."""
+        """Assign global IDs via pairwise cosine matching across cameras + temporal prototype updates."""
         cross_view_ids: Dict[int, Tensor] = {}
-        used_gids_per_cam: Dict[int, set] = {}
+
+        candidates: List[Dict[str, object]] = []
+        by_cam: Dict[int, List[int]] = {}
 
         for cam_idx, track_instances in track_instances_by_cam.items():
             device = track_instances.obj_idxes.device
             cross_view_ids[cam_idx] = torch.full(
                 (len(track_instances),), -1, dtype=torch.long, device=device
             )
-            used_gids_per_cam[cam_idx] = set()
 
             if len(track_instances) == 0 or not track_instances.has('output_embedding'):
+                by_cam[cam_idx] = []
                 continue
 
             valid = track_instances.obj_idxes >= 0
@@ -574,6 +576,7 @@ class MultiviewMOTR(nn.Module):
                 valid = valid & (track_instances.scores >= self.track_bases[cam_idx].filter_score_thresh)
             valid_indices = valid.nonzero(as_tuple=False).squeeze(1)
 
+            by_cam[cam_idx] = []
             for track_idx in valid_indices.tolist():
                 local_id = int(track_instances.obj_idxes[track_idx].item())
                 local_key = (cam_idx, local_id)
@@ -583,46 +586,130 @@ class MultiviewMOTR(nn.Module):
                     emb = emb.flatten()
                 emb = F.normalize(emb, dim=0)
 
+                cand_idx = len(candidates)
+                candidates.append({
+                    'cam_idx': cam_idx,
+                    'track_idx': int(track_idx),
+                    'local_key': local_key,
+                    'emb': emb,
+                })
+                by_cam[cam_idx].append(cand_idx)
+
+        if len(candidates) == 0:
+            return cross_view_ids
+
+        parent = list(range(len(candidates)))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # Pairwise cosine across cameras (mutual-best + threshold delta).
+        delta = float(self.cross_view_reid_match_thresh)
+        cam_ids = sorted(by_cam.keys())
+        for i in range(len(cam_ids)):
+            ca = cam_ids[i]
+            idx_a = by_cam.get(ca, [])
+            if len(idx_a) == 0:
+                continue
+            emb_a = torch.stack([candidates[idx]['emb'] for idx in idx_a], dim=0)
+
+            for j in range(i + 1, len(cam_ids)):
+                cb = cam_ids[j]
+                idx_b = by_cam.get(cb, [])
+                if len(idx_b) == 0:
+                    continue
+
+                emb_b = torch.stack([candidates[idx]['emb'] for idx in idx_b], dim=0)
+                sim = emb_a @ emb_b.t()  # pairwise cosine for L2-normalized features
+
+                best_b_for_a = sim.argmax(dim=1)
+                best_a_for_b = sim.argmax(dim=0)
+
+                for a_pos in range(sim.shape[0]):
+                    b_pos = int(best_b_for_a[a_pos].item())
+                    # Keep only confident mutual-best correspondences.
+                    if int(best_a_for_b[b_pos].item()) != a_pos:
+                        continue
+                    if float(sim[a_pos, b_pos].item()) < delta:
+                        continue
+                    union(idx_a[a_pos], idx_b[b_pos])
+
+        components: Dict[int, List[int]] = {}
+        for idx in range(len(candidates)):
+            root = find(idx)
+            components.setdefault(root, []).append(idx)
+
+        for member_indices in components.values():
+            comp_emb = torch.stack([candidates[idx]['emb'] for idx in member_indices], dim=0).mean(dim=0)
+            comp_emb = F.normalize(comp_emb, dim=0)
+
+            prior_gids = []
+            for idx in member_indices:
+                local_key = candidates[idx]['local_key']
                 if local_key in self._cross_view_local_to_global:
-                    gid = self._cross_view_local_to_global[local_key]
-                else:
-                    gid = -1
-                    best_sim = -1.0
-                    for cand_gid, proto in self._cross_view_global_proto.items():
-                        if cand_gid in used_gids_per_cam[cam_idx]:
-                            continue
-                        sim = torch.dot(emb, proto).item()
-                        if sim > best_sim:
-                            best_sim = sim
-                            gid = cand_gid
+                    prior_gids.append(int(self._cross_view_local_to_global[local_key]))
 
-                    if gid >= 0 and best_sim >= self.cross_view_reid_match_thresh:
-                        self._cross_view_local_to_global[local_key] = gid
-                        self._cross_view_global_tracks.setdefault(gid, []).append(local_key)
-                    else:
-                        gid = self._next_cross_view_global_id
-                        self._next_cross_view_global_id += 1
-                        self._cross_view_local_to_global[local_key] = gid
-                        self._cross_view_global_tracks[gid] = [local_key]
-                        self._cross_view_global_proto[gid] = emb
+            if len(prior_gids) > 0:
+                gid_votes: Dict[int, int] = {}
+                for gid in prior_gids:
+                    gid_votes[gid] = gid_votes.get(gid, 0) + 1
+                gid = max(gid_votes.items(), key=lambda x: (x[1], x[0]))[0]
+            else:
+                gid = -1
+                best_sim = -1.0
+                for cand_gid, proto in self._cross_view_global_proto.items():
+                    sim = float(torch.dot(comp_emb, proto).item())
+                    if sim > best_sim:
+                        best_sim = sim
+                        gid = int(cand_gid)
 
-                if gid not in self._cross_view_global_proto:
-                    self._cross_view_global_proto[gid] = emb
-                else:
-                    m = self.cross_view_reid_momentum
-                    proto = self._cross_view_global_proto[gid]
-                    self._cross_view_global_proto[gid] = F.normalize(m * proto + (1.0 - m) * emb, dim=0)
+                if gid < 0 or best_sim < delta:
+                    gid = self._next_cross_view_global_id
+                    self._next_cross_view_global_id += 1
 
-                used_gids_per_cam[cam_idx].add(gid)
+            for idx in member_indices:
+                cam_idx = int(candidates[idx]['cam_idx'])
+                track_idx = int(candidates[idx]['track_idx'])
+                local_key = candidates[idx]['local_key']
+                self._cross_view_local_to_global[local_key] = gid
+                self._cross_view_global_tracks.setdefault(gid, []).append(local_key)
                 cross_view_ids[cam_idx][track_idx] = gid
+
+            if gid not in self._cross_view_global_proto:
+                self._cross_view_global_proto[gid] = comp_emb
+            else:
+                m = float(self.cross_view_reid_momentum)
+                proto = self._cross_view_global_proto[gid]
+                self._cross_view_global_proto[gid] = F.normalize(m * proto + (1.0 - m) * comp_emb, dim=0)
 
         return cross_view_ids
 
     def _export_cross_view_matches(self) -> Dict[int, List[Tuple[int, int]]]:
+        # Export only active matches from the current frame context.
+        # This avoids printing historical accumulated local IDs.
+        active_by_gid: Dict[int, List[Tuple[int, int]]] = {}
+        for (cam_idx, gid), state in self._tmp_track_state.items():
+            if int(state.get('active', 0)) != 1:
+                continue
+            local_id = int(state.get('local_id', -1))
+            if local_id < 0:
+                continue
+            active_by_gid.setdefault(int(gid), []).append((int(cam_idx), local_id))
+
         matches: Dict[int, List[Tuple[int, int]]] = {}
-        for gid, pairs in self._cross_view_global_tracks.items():
+        for gid, pairs in active_by_gid.items():
             unique_pairs = sorted(set((int(c), int(l)) for c, l in pairs))
-            matches[int(gid)] = unique_pairs
+            # Keep only real cross-view associations (>= 2 cameras).
+            if len({c for c, _ in unique_pairs}) >= 2:
+                matches[int(gid)] = unique_pairs
         return matches
 
     # ------------------------------------------------------------------
