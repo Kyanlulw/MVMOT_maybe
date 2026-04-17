@@ -619,32 +619,10 @@ class MultiviewMOTR(nn.Module):
         return cross_view_ids
 
     def _export_cross_view_matches(self) -> Dict[int, List[Tuple[int, int]]]:
-        # Prefer active TMP state so export reflects current frame alignment,
-        # not the full historical accumulation of local IDs.
-        active_matches: Dict[int, List[Tuple[int, int]]] = {}
-        for (cam_idx, gid), state in self._tmp_track_state.items():
-            if int(state.get('active', 0)) != 1:
-                continue
-            local_id = int(state.get('local_id', -1))
-            if local_id < 0:
-                continue
-            active_matches.setdefault(int(gid), []).append((int(cam_idx), local_id))
-
-        if len(active_matches) > 0:
-            filtered: Dict[int, List[Tuple[int, int]]] = {}
-            for gid, pairs in active_matches.items():
-                unique_pairs = sorted(set((int(c), int(l)) for c, l in pairs))
-                # Keep only true cross-view groups (present in >= 2 cameras).
-                if len({c for c, _ in unique_pairs}) >= 2:
-                    filtered[int(gid)] = unique_pairs
-            return filtered
-
-        # Fallback for cases where TMP state is not populated yet.
         matches: Dict[int, List[Tuple[int, int]]] = {}
         for gid, pairs in self._cross_view_global_tracks.items():
             unique_pairs = sorted(set((int(c), int(l)) for c, l in pairs))
-            if len({c for c, _ in unique_pairs}) >= 2:
-                matches[int(gid)] = unique_pairs
+            matches[int(gid)] = unique_pairs
         return matches
 
     # ------------------------------------------------------------------

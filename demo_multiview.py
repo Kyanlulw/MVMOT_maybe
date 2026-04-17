@@ -103,6 +103,8 @@ def draw_tracks_multiview(
     global_id_mapping=None,
     color_map=None,
     score_thresh=0.5,
+    box_thickness=1,
+    font_scale=0.4,
 ):
     """
     Draw tracking results on multi-view images.
@@ -167,7 +169,7 @@ def draw_tracks_multiview(
                 color = color_map[display_id]
 
                 x1, y1, x2, y2 = boxes[i].astype(int)
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, max(1, int(box_thickness)))
 
                 # Label with both local and global ID
                 if global_id >= 0:
@@ -176,10 +178,11 @@ def draw_tracks_multiview(
                     label = f"L{obj_id}"
                 label += f" {scores[i]:.2f}"
 
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                text_thickness = max(1, int(box_thickness))
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, float(font_scale), text_thickness)
                 cv2.rectangle(img, (x1, y1 - th - 4), (x1 + tw, y1), color, -1)
                 cv2.putText(img, label, (x1, y1 - 2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                           cv2.FONT_HERSHEY_SIMPLEX, float(font_scale), (255, 255, 255), text_thickness)
 
         # Add camera label
         cv2.putText(img, cam_name, (10, 30),
@@ -196,10 +199,10 @@ def create_video_writer(output_video, frame_size, fps=30):
     ext = target.suffix.lower()
 
     candidates_by_ext = {
-        '.mp4': [('mp4v', '.mp4'), ('avc1', '.mp4'), ('H264', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')],
-        '.avi': [('XVID', '.avi'), ('MJPG', '.avi'), ('mp4v', '.avi')],
-        '.mkv': [('mp4v', '.mkv'), ('XVID', '.avi'), ('MJPG', '.avi')],
-        'default': [('mp4v', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')],
+        '.mp4': [('MJPG', '.avi'), ('XVID', '.avi')],
+        '.avi': [('MJPG', '.avi'), ('XVID', '.avi')],
+        '.mkv': [('MJPG', '.avi'), ('XVID', '.avi')],
+        'default': [('MJPG', '.avi'), ('XVID', '.avi')],
     }
     candidates = candidates_by_ext.get(ext, candidates_by_ext['default'])
 
@@ -226,44 +229,6 @@ def create_video_writer(output_video, frame_size, fps=30):
     )
 
 
-def print_criterion_debug(model):
-    """Print uncertainty-related criterion weights for camera 0 when available."""
-    criterion = getattr(model, 'criterion', None)
-    if criterion is None:
-        print('Criterion debug: model has no criterion attached.')
-        return
-
-    cam_criterion = None
-    criteria = getattr(criterion, 'criteria', None)
-    if criteria is not None and len(criteria) > 0:
-        cam_criterion = criteria[0]
-    else:
-        cam_criterion = criterion
-
-    w1 = getattr(cam_criterion, 'w1', None)
-    w2 = getattr(cam_criterion, 'w2', None)
-
-    # Current codebase stores uncertainty terms as log variances.
-    if w1 is None:
-        w1 = getattr(cam_criterion, 'log_var_tracking', None)
-    if w2 is None:
-        w2 = getattr(cam_criterion, 'log_var_reid', None)
-
-    def _to_scalar(value):
-        if value is None:
-            return None
-        if torch.is_tensor(value):
-            return float(value.detach().cpu().item())
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    w1_val = _to_scalar(w1)
-    w2_val = _to_scalar(w2)
-    print(f'Criterion debug cam0: w1={w1_val}, w2={w2_val}')
-
-
 def main():
     parser = argparse.ArgumentParser('Multi-View MOTR Demo', parents=[get_args_parser()])
     parser.set_defaults(use_reid_query=True)
@@ -271,10 +236,16 @@ def main():
                        help='Path to the scene directory with camera subdirectories')
     parser.add_argument('--camera_names', type=str, nargs='*', default=None,
                        help='Optional camera subdirectory names; if omitted, discover automatically')
-    parser.add_argument('--output_video', type=str, default='multiview_output.mp4',
-                       help='Output video path')
+    parser.add_argument('--output_video', type=str, default='multiview_output.avi',
+                       help='Output video path (AVI recommended for compatibility)')
     parser.add_argument('--score_thresh', type=float, default=0.5,
                        help='Score threshold for visualization')
+    parser.add_argument('--output_fps', type=float, default=10.0,
+                       help='Output video FPS (lower value gives slower playback)')
+    parser.add_argument('--box_thickness', type=int, default=1,
+                       help='Bounding box line thickness for visualization')
+    parser.add_argument('--label_font_scale', type=float, default=0.4,
+                       help='Label font scale for visualization')
     parser.add_argument('--no_use_reid_query', dest='use_reid_query', action='store_false',
                        help='Disable ReID query branch during demo inference')
     args = parser.parse_args()
@@ -305,8 +276,6 @@ def main():
         model = load_model(model, args.resume)
         print(f"Loaded model from {args.resume}")
 
-    print_criterion_debug(model)
-
     # Setup transforms
     transforms = make_inference_transforms()
 
@@ -330,15 +299,21 @@ def main():
     grid_rows = int(math.ceil(num_cams / grid_cols))
     total_w = w * grid_cols
     total_h = h * grid_rows
+    requested_output = Path(args.output_video)
+    if requested_output.suffix.lower() != '.avi':
+        print(f"Requested {args.output_video}; forcing AVI output for compatibility.")
+    forced_output = str(requested_output.with_suffix('.avi'))
+
     out_video, output_video_path, output_codec = create_video_writer(
-        args.output_video,
+        forced_output,
         (total_w, total_h),
-        fps=30,
+        fps=float(args.output_fps),
     )
-    if output_video_path != args.output_video:
-        print(f"Requested output {args.output_video} not supported, using {output_video_path} ({output_codec}).")
+    if output_video_path != forced_output:
+        print(f"Requested output {forced_output} not supported, using {output_video_path} ({output_codec}).")
     else:
         print(f"Using video codec {output_codec} for output {output_video_path}.")
+    print(f"Output FPS set to {float(args.output_fps):.2f}")
 
     # Run tracking
     track_instances_list = None
@@ -384,6 +359,8 @@ def main():
             global_id_mapping=results.get('cross_view_matches'),
             color_map=color_map,
             score_thresh=args.score_thresh,
+            box_thickness=args.box_thickness,
+            font_scale=args.label_font_scale,
         )
 
         # Create a fixed-size grid frame.
