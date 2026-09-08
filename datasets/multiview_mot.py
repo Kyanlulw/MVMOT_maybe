@@ -80,10 +80,20 @@ class MultiViewMOTDetection:
 
         self._parse_data_file(data_txt_path, seqs_folder)
         for scene in self.scenes:
-            if len(scene['cameras']) != self.num_views:
+            available_views = len(scene['cameras'])
+            if available_views < self.num_views:
                 raise ValueError(
-                    f"Scene {scene['name']} provides {len(scene['cameras'])} cameras, "
+                    f"Scene {scene['name']} provides {available_views} cameras, "
                     f"but --num_cams={self.num_views}."
+                )
+            if available_views > self.num_views:
+                # A manifest generated for all WildTrack cameras can be reused
+                # for a lower-view experiment. Preserve the manifest order so
+                # camera selection stays deterministic across train and val.
+                scene['cameras'] = scene['cameras'][:self.num_views]
+                print(
+                    f"MultiView: using the first {self.num_views} of "
+                    f"{available_views} cameras for scene {scene['name']}"
                 )
 
         # Video sampler (same logic as single-view)
