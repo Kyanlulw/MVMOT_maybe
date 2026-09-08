@@ -3,15 +3,20 @@ set -eu
 # Usage:
 #   bash configs/r50_multiview_motr_train_wildtrack.sh "0,1" /path/to/wildtrack_mvmot ./output/wildtrack_motr
 # If GPU_IDS is omitted, this script will use all visible GPUs.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 GPU_IDS=${1:-""}
-MOT_PATH=${2:-"/kaggle/working/MVMOT_maybe/wildtrack_mvmot"}
-OUTPUT_DIR=${3:-"./output/wildtrack_motr"}
+MOT_PATH=${2:-"$REPO_ROOT/wildtrack_mvmot"}
+OUTPUT_DIR=${3:-"$REPO_ROOT/output/wildtrack_motr"}
+TRAIN_SPLIT=${DATA_TXT_PATH_TRAIN:-"$REPO_ROOT/datasets/data_path/multiview_wildtrack.train"}
+VAL_SPLIT=${DATA_TXT_PATH_VAL:-"$REPO_ROOT/datasets/data_path/multiview_wildtrack.val"}
+PYTHON=${PYTHON:-python}
 
 # Optional checkpoint. Set PRETRAIN to an explicit file, or leave it empty to
 # start from the model initialization. The Kaggle checkpoint is used only when
 # it is actually mounted in the current notebook.
 PRETRAIN=${PRETRAIN:-""}
-PRETRAIN_PATH=${PRETRAIN_PATH:-"/kaggle/input/models/trnlqung/9epochmvmot/pytorch/default/1/checkpoint0009.pth"}
+PRETRAIN_PATH=${PRETRAIN_PATH:-""}
 if [ -z "$PRETRAIN" ] && [ -f "$PRETRAIN_PATH" ]; then
 	PRETRAIN="$PRETRAIN_PATH"
 fi
@@ -60,8 +65,8 @@ set -- \
     --extra_track_attn \
     --use_checkpoint \
     --mot_path "$MOT_PATH" \
-    --data_txt_path_train /kaggle/working/MVMOT_maybe/datasets/data_path/multiview_wildtrack.train \
-    --data_txt_path_val /kaggle/working/MVMOT_maybe/datasets/data_path/multiview_wildtrack.val \
+    --data_txt_path_train "$TRAIN_SPLIT" \
+    --data_txt_path_val "$VAL_SPLIT" \
     --wandb \
     --wandb_project fusiontrack_wildtrack \
     --num_cams 7 \
@@ -73,4 +78,4 @@ if [ -n "$PRETRAIN" ]; then
 	set -- "$@" --pretrained "$PRETRAIN"
 fi
 
-python -m torch.distributed.launch --nproc_per_node="$GPUS" --master_port="$PORT" --use_env main.py "$@"
+"$PYTHON" -m torch.distributed.launch --nproc_per_node="$GPUS" --master_port="$PORT" --use_env main.py "$@"
