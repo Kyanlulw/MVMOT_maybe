@@ -1,9 +1,11 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from main import get_args_parser, _write_training_manifest
 from models.deformable_transformer_plus import DeformableTransformer
 from models.multiview.multiview import MultiviewClipMatcher
 from util.misc import inverse_sigmoid
@@ -12,6 +14,34 @@ from engine import train_one_epoch_multiview_mot
 
 
 class FusionTrackRegression(unittest.TestCase):
+    def test_training_manifest_written_with_hyperparameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = get_args_parser().parse_args([])
+            args.output_dir = directory
+            args.dataset_file = 'e2e_mv_mot'
+            args.meta_arch = 'fusiontrack_motr'
+            args.device = 'cpu'
+            args.distributed = False
+            args.rank = 0
+            args.world_size = 1
+            model = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
+
+            manifest_path = _write_training_manifest(
+                args, 3, optimizer, scheduler, [0, 1], [0],
+            )
+
+            latest_path = Path(directory) / 'training_manifest_latest.json'
+            self.assertTrue(manifest_path.exists())
+            self.assertTrue(latest_path.exists())
+            manifest = json.loads(latest_path.read_text(encoding='utf-8'))
+            self.assertEqual(manifest['hyperparameters']['output_dir'], directory)
+            self.assertEqual(manifest['model']['meta_arch'], 'fusiontrack_motr')
+            self.assertEqual(manifest['data']['train_batches_per_epoch'], 2)
+            self.assertEqual(manifest['optimizer']['type'], 'AdamW')
+            self.assertEqual(manifest['lr_scheduler']['type'], 'StepLR')
+
     def test_cosine_starts_after_warmup_and_finishes_at_zero(self):
         class ToyModel(torch.nn.Module):
             def __init__(self):

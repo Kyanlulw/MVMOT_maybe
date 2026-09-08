@@ -13,7 +13,9 @@
 import argparse
 import datetime
 import json
+import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -46,6 +48,114 @@ MOT_LIKE_DATASETS = {
     'e2e_joint',
     'e2e_mv_mot',
 }
+
+
+def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return str(value)
+
+
+def _optimizer_param_groups_for_manifest(optimizer):
+    param_groups = []
+    for group in optimizer.param_groups:
+        serializable_group = {
+            key: _json_safe(value)
+            for key, value in group.items()
+            if key != 'params'
+        }
+        serializable_group['n_parameters'] = sum(
+            p.numel() for p in group.get('params', [])
+        )
+        param_groups.append(serializable_group)
+    return param_groups
+
+
+def _build_training_manifest(args, n_parameters, optimizer, lr_scheduler,
+                             train_loader_len, val_loader_len):
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        'schema_version': 1,
+        'run_id': started_at.strftime('%Y%m%dT%H%M%SZ'),
+        'created_at_utc': started_at.isoformat(),
+        'git': utils.get_sha(),
+        'command': {
+            'python': sys.executable,
+            'argv': sys.argv,
+        },
+        'runtime': {
+            'torch_version': torch.__version__,
+            'cuda_available': torch.cuda.is_available(),
+            'cuda_device_count': torch.cuda.device_count(),
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+            'pytorch_alloc_conf': os.environ.get('PYTORCH_ALLOC_CONF'),
+            'pytorch_cuda_alloc_conf': os.environ.get('PYTORCH_CUDA_ALLOC_CONF'),
+            'distributed': getattr(args, 'distributed', False),
+            'rank': utils.get_rank(),
+            'world_size': utils.get_world_size(),
+            'device': args.device,
+            'seed': args.seed,
+            'rank_seed': args.seed + utils.get_rank(),
+        },
+        'hyperparameters': _json_safe(vars(args)),
+        'model': {
+            'meta_arch': args.meta_arch,
+            'backbone': args.backbone,
+            'num_parameters_trainable': n_parameters,
+            'num_queries': args.num_queries,
+            'num_cams': getattr(args, 'num_cams', None),
+            'use_reid_query': getattr(args, 'use_reid_query', False),
+            'use_uncertainty_loss': getattr(args, 'use_uncertainty_loss', False),
+        },
+        'data': {
+            'dataset_file': args.dataset_file,
+            'mot_path': getattr(args, 'mot_path', None),
+            'data_txt_path_train': getattr(args, 'data_txt_path_train', None),
+            'data_txt_path_val': getattr(args, 'data_txt_path_val', None),
+            'train_batches_per_epoch': train_loader_len,
+            'val_batches': val_loader_len,
+        },
+        'optimizer': {
+            'type': optimizer.__class__.__name__,
+            'param_groups': _optimizer_param_groups_for_manifest(optimizer),
+        },
+        'lr_scheduler': {
+            'type': lr_scheduler.__class__.__name__,
+            'state': _json_safe(lr_scheduler.state_dict()),
+            'interval': args.lr_scheduler_interval,
+            'cosine_start_epoch': args.cosine_start_epoch,
+        },
+    }
+
+
+def _write_training_manifest(args, n_parameters, optimizer, lr_scheduler,
+                             data_loader_train, data_loader_val):
+    if not args.output_dir or not utils.is_main_process():
+        return None
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _build_training_manifest(
+        args, n_parameters, optimizer, lr_scheduler,
+        len(data_loader_train), len(data_loader_val),
+    )
+    run_id = manifest['run_id']
+    manifest_path = output_dir / f'training_manifest_{run_id}.json'
+    latest_path = output_dir / 'training_manifest_latest.json'
+
+    for path in (manifest_path, latest_path):
+        with path.open('w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write('\n')
+
+    print(f'Wrote training manifest to {manifest_path}')
+    return manifest_path
 
 
 def get_args_parser():
@@ -443,6 +553,11 @@ def main(args):
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
+
+    _write_training_manifest(
+        args, n_parameters, optimizer, lr_scheduler,
+        data_loader_train, data_loader_val,
+    )
 
     print("Start training")
     start_time = time.time()
