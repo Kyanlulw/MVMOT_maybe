@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 set -eu
 # Usage:
-#   sh configs/r50_multiview_motr_train_wildtrack.sh "0,1" /path/to/wildtrack_mvmot ./output/wildtrack_motr_4cam
+#   sh configs/r50_multiview_motr_train_wildtrack.sh "0,1" /path/to/wildtrack_mvmot ./output/wildtrack_motr_3cam
 # If GPU_IDS is omitted, this script will use all visible GPUs.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 GPU_IDS=${1:-""}
 MOT_PATH=${2:-"$REPO_ROOT/wildtrack_mvmot"}
-OUTPUT_DIR=${3:-"$REPO_ROOT/output/wildtrack_motr_4cam"}
+OUTPUT_DIR=${3:-"$REPO_ROOT/output/wildtrack_motr_3cam"}
 TRAIN_SPLIT=${DATA_TXT_PATH_TRAIN:-"$REPO_ROOT/datasets/data_path/multiview_wildtrack.train"}
 VAL_SPLIT=${DATA_TXT_PATH_VAL:-"$REPO_ROOT/datasets/data_path/multiview_wildtrack.val"}
 PYTHON=${PYTHON:-python}
@@ -41,9 +41,9 @@ PORT=${MASTER_PORT:-29500}
 echo "Using GPUs: $CUDA_VISIBLE_DEVICES (nproc_per_node=$GPUS)"
 echo "Pretrained checkpoint: ${PRETRAIN:-<none>}"
 
-# Progressive temporal context keeps four-camera training within the memory
-# budget: 1 frame (0-19), 2 frames (20-59), 3 frames (60-89), then 4 frames
-# (90-119). The maximum sample contains 4 cameras x 4 frames = 16 images.
+# Progressive temporal context keeps three-camera training within the memory
+# budget: 1 frame (0-19), 2 frames (20-59), then 3 frames (60-119). The
+# maximum sample contains 3 cameras x 3 frames = 9 images.
 
 set -- \
     --meta_arch fusiontrack_motr \
@@ -62,8 +62,8 @@ set -- \
     --batch_size 1 \
     --sample_mode fixed_interval \
     --sample_interval 1 \
-    --sampler_steps 20 60 90 \
-    --sampler_lengths 1 2 3 4 \
+    --sampler_steps 20 60 \
+    --sampler_lengths 1 2 3 \
     --update_query_pos \
     --merger_dropout 0 \
     --dropout 0 \
@@ -76,8 +76,8 @@ set -- \
     --data_txt_path_train "$TRAIN_SPLIT" \
     --data_txt_path_val "$VAL_SPLIT" \
     --wandb \
-    --wandb_project fusiontrack_wildtrack_4cam \
-    --num_cams 4 \
+    --wandb_project fusiontrack_wildtrack_3cam \
+    --num_cams 3 \
     --reid_warmup_epochs 20 \
     --reid_num_layers 12 \
     --reid_num_heads 6 \
