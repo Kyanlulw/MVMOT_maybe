@@ -236,11 +236,18 @@ class ClipMatcher(SetCriterion):
             filtered_idx.append((src_per_img[keep], tgt_per_img[keep]))
         indices = filtered_idx
         idx = self._get_src_permutation_idx(indices)
+        idx = tuple(index.to(outputs['pred_boxes'].device) for index in idx)
         src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([gt_per_img.boxes[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0)
+        target_boxes = torch.cat([
+            gt_per_img.boxes[i.to(gt_per_img.boxes.device)]
+            for gt_per_img, (_, i) in zip(gt_instances, indices)
+        ], dim=0).to(src_boxes.device)
 
         # for pad target, don't calculate regression loss, judged by whether obj_id=-1
-        target_obj_ids = torch.cat([gt_per_img.obj_ids[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0) # size(16)
+        target_obj_ids = torch.cat([
+            gt_per_img.obj_ids[i.to(gt_per_img.obj_ids.device)]
+            for gt_per_img, (_, i) in zip(gt_instances, indices)
+        ], dim=0).to(src_boxes.device) # size(16)
         mask = (target_obj_ids != -1)
 
         loss_bbox = F.l1_loss(src_boxes[mask], target_boxes[mask], reduction='none')
@@ -260,15 +267,19 @@ class ClipMatcher(SetCriterion):
         """
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
+        idx = tuple(index.to(src_logits.device) for index in idx)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         # The matched gt for disappear track query is set -1.
         labels = []
         for gt_per_img, (_, J) in zip(gt_instances, indices):
-            labels_per_img = torch.ones_like(J)
+            labels_per_img = torch.ones_like(J, device=src_logits.device)
             # set labels of track-appear slots to 0.
             if len(gt_per_img) > 0:
-                labels_per_img[J != -1] = gt_per_img.labels[J[J != -1]]
+                valid = J != -1
+                if valid.any():
+                    gt_indices = J[valid].to(gt_per_img.labels.device)
+                    labels_per_img[valid] = gt_per_img.labels[gt_indices].to(src_logits.device)
             labels.append(labels_per_img)
         target_classes_o = torch.cat(labels)
         target_classes[idx] = target_classes_o
