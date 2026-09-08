@@ -152,12 +152,18 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        if key_padding_mask is not None:
+            # True entries are padding and cannot be attended to.
+            attn = attn.masked_fill(
+                key_padding_mask[:, None, None, :].to(torch.bool),
+                torch.finfo(attn.dtype).min,
+            )
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -181,9 +187,11 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(self, x, key_padding_mask=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), key_padding_mask))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if key_padding_mask is not None:
+            x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return x
 
 

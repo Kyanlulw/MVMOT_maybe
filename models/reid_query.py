@@ -253,10 +253,13 @@ class TrajectoryReIDBackbone(nn.Module):
         # so we handle padding via zeroing out padded positions after each block.
         # ----------------------------------------------------------
         for block in self.vit.blocks:
-            x = block(x)
-            # Zero out padded positions so they don't influence subsequent
-            # blocks through residual connections
-            x[full_mask] = 0.0
+            try:
+                x = block(x, key_padding_mask=full_mask)
+            except TypeError:
+                # Compatibility with third-party ViT blocks that do not
+                # expose masking.  Zeroing remains a safe fallback.
+                x = block(x)
+                x[full_mask] = 0.0
 
         x = self.vit.norm(x)                        # [N_alive, tau2+1, vit_dim]
 
@@ -502,6 +505,15 @@ class ReIDQueryModule(nn.Module):
             label_smoothing = label_smoothing,
         )
 
+        # Create this before optimizer/DDP construction.  The previous lazy
+        # creation path silently left the projection out of the optimizer.
+        self.output_proj = (
+            nn.Linear(self.backbone.vit_dim, self.track_dim)
+            if self.backbone.vit_dim != self.track_dim else nn.Identity()
+        )
+        self.last_raw_features: Optional[Tensor] = None
+        self.last_target_ids: Optional[Tensor] = None
+
     # ------------------------------------------------------------------
     # Internal: extract tau2-length sequence from one TrackQueue
     # ------------------------------------------------------------------
@@ -631,6 +643,8 @@ class ReIDQueryModule(nn.Module):
             id_loss          : scalar CE loss (training) or None (inference).
         """
         device = track_instances.output_embedding.device
+        self.last_raw_features = None
+        self.last_target_ids = None
 
         # ----------------------------------------------------------------
         # Step 1 -- push current frame's embeddings into QueueMemoryBank.
@@ -665,7 +679,7 @@ class ReIDQueryModule(nn.Module):
         # ----------------------------------------------------------------
         seq_list, fidx_list, pad_list = [], [], []
 
-        for obj_id in alive_obj_ids:
+        for alive_pos, obj_id in enumerate(alive_obj_ids):
             track_queue = queue_bank.get_queue(cam_idx, int(obj_id))
 
             if track_queue is None or len(track_queue) == 0:
@@ -675,6 +689,21 @@ class ReIDQueryModule(nn.Module):
                 pad_mask = torch.ones( self.tau2, dtype=torch.bool,  device=device)
             else:
                 fidxs, embeds, pad_mask = self._build_sequence(track_queue, device)
+
+            # The queue stores detached historical snapshots.  The current
+            # observation must remain connected to the tracking graph so the
+            # ReID loss jointly trains the detector/tracker.  Always place it
+            # at the newest valid position, even when score filtering omitted
+            # it from the FIFO queue.
+            valid_positions = (~pad_mask).nonzero(as_tuple=False).flatten()
+            if len(valid_positions) == 0:
+                current_pos = self.tau2 - 1
+                pad_mask[current_pos] = False
+                fidxs[current_pos] = int(global_frame_idx)
+            else:
+                current_pos = int(valid_positions[-1].item())
+                fidxs[current_pos] = int(global_frame_idx)
+            embeds[current_pos] = track_instances.output_embedding[alive_indices[alive_pos]]
 
             fidx_list.append(fidxs)
             seq_list.append(embeds)
@@ -713,6 +742,10 @@ class ReIDQueryModule(nn.Module):
                   if view_label is not None else None)
 
         F_id = self.backbone(seq_batch, pad_batch, cam_t, view_t)   # [N_alive, vit_dim]
+        # Expose the graph-connected features for synchronized cross-camera
+        # triplet mining in the multiview wrapper.
+        self.last_raw_features = F_id
+        self.last_target_ids = target_ids
 
         # ----------------------------------------------------------------
         # Step 6 -- Output Layer: BN normalisation + CE + Triplet losses
@@ -725,24 +758,20 @@ class ReIDQueryModule(nn.Module):
         feat, loss_dict = self.output_layer(F_id, target_ids)      # [N_alive, vit_dim]
 
         # ----------------------------------------------------------------
-        # Step 7 -- write F_id back into track_instances.output_embedding.
-        #
-        #   If vit_dim != track_dim, project back so the downstream QIM
-        #   receives the same dimension it expects.
-        #   Only alive tracks are overwritten; new/unmatched slots keep
-        #   their raw transformer embedding unchanged.
+        # Step 7 -- expose the identity feature separately from the tracker
+        # embedding. QIM continues to consume the original
+        # track_instances.output_embedding (track_dim), while cross-view
+        # association consumes this normalized ReID feature (vit_dim).
+        # Only alive tracks are populated; new/unmatched slots stay zero.
         # ----------------------------------------------------------------
-        updated = track_instances.output_embedding.clone()
-
-        if self.backbone.vit_dim != self.track_dim:
-            if not hasattr(self, 'output_proj'):
-                self.output_proj = nn.Linear(
-                    self.backbone.vit_dim, self.track_dim
-                ).to(device)
-            feat = self.output_proj(feat)                           # [N_alive, track_dim]
-
+        updated = track_instances.output_embedding.new_zeros(
+            (len(track_instances), self.backbone.vit_dim)
+        )
         updated[alive_indices] = feat
-        track_instances.output_embedding = updated
+        # Keep tracker/query features and identity features separate.  QIM
+        # must receive the tracking embedding; cross-view association consumes
+        # this ReID representation.
+        track_instances.reid_embedding = updated
 
         return track_instances, loss_dict
         # loss_dict is None at inference.

@@ -79,6 +79,12 @@ class MultiViewMOTDetection:
         self._next_global_frame_offset = 0
 
         self._parse_data_file(data_txt_path, seqs_folder)
+        for scene in self.scenes:
+            if len(scene['cameras']) != self.num_views:
+                raise ValueError(
+                    f"Scene {scene['name']} provides {len(scene['cameras'])} cameras, "
+                    f"but --num_cams={self.num_views}."
+                )
 
         # Video sampler (same logic as single-view)
         self.sampler_steps = args.sampler_steps
@@ -462,20 +468,26 @@ def make_multiview_transforms(image_set, args=None):
         T.MotNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    if getattr(args, 'smoke_train', False):
+        scales = [256]
+        max_size = 320
+    else:
+        scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+        max_size = 1333
 
     if image_set == 'train':
         color_transforms = []
         scale_transforms = [
             T.MotRandomHorizontalFlip(),
-            T.MotRandomResize(scales, max_size=1333),
+            T.MotRandomResize(scales, max_size=max_size),
             normalize,
         ]
         return T.MotCompose(color_transforms + scale_transforms)
 
     if image_set == 'val':
         return T.MotCompose([
-            T.MotRandomResize([800], max_size=1333),
+            T.MotRandomResize([256 if getattr(args, 'smoke_train', False) else 800],
+                              max_size=320 if getattr(args, 'smoke_train', False) else 1333),
             normalize,
         ])
 

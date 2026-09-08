@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motr-fusiontrack"
+version = "0.1.0"
+description = "MOTR multi-view tracking with the seven-camera FusionTrack path"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "MOTR/FusionTrack contributors" },
+]
+dependencies = [
+    "pycocotools",
+    "tqdm",
+    "cython",
+    "scipy",
+    "motmetrics",
+    "opencv-python",
+    "seaborn",
+    "lap",
+    "wandb",
+]
+
+[project.optional-dependencies]
+# Install a CUDA- or CPU-compatible PyTorch build separately when needed.
+torch = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.6",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datasets*", "models*", "util*"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = [
+    "output",
+    "tmp_smoke_mv",
+]

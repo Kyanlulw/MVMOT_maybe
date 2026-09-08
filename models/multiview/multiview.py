@@ -41,7 +41,11 @@ from ..memory_bank import build_memory_bank
 from ..temp import QueueMemoryBank
 from ..deformable_detr import SetCriterion, MLP
 from ..segmentation import sigmoid_focal_loss
-from ..reid_query import ReIDQueryModule, build_reid_query_vit_model
+from ..reid_query import (
+    ReIDQueryModule,
+    build_reid_query_vit_model,
+    _batch_hard_triplet_loss,
+)
 
 # Re-use ClipMatcher unchanged — it is instantiated once per camera during training.
 from ..motr import ClipMatcher, TrackerPostProcess, RuntimeTrackerBase, _get_clones
@@ -70,6 +74,11 @@ class MultiviewClipMatcher(nn.Module):
     ):
         super().__init__()
         self.num_cams = num_cams
+        self.use_uncertainty_loss = bool(use_uncertainty_loss)
+        self.reid_enabled = True
+        if self.use_uncertainty_loss:
+            self.log_var_tracking = nn.Parameter(torch.tensor(float(uncertainty_init_tracking)))
+            self.log_var_reid = nn.Parameter(torch.tensor(float(uncertainty_init_reid)))
         # One criterion per camera (they share the same config but keep separate state).
         self.criteria: List[ClipMatcher] = nn.ModuleList(
             [
@@ -78,20 +87,22 @@ class MultiviewClipMatcher(nn.Module):
                     matcher,
                     weight_dict,
                     losses,
-                    use_uncertainty_loss=use_uncertainty_loss,
-                    uncertainty_init_tracking=uncertainty_init_tracking,
-                    uncertainty_init_reid=uncertainty_init_reid,
+                    # Uncertainty is shared across all cameras below.
+                    use_uncertainty_loss=False,
                 )
                 for _ in range(num_cams)
             ]
         )
 
         per_cam_weight_dict = self.criteria[0].weight_dict if num_cams > 0 else {}
-        self.weight_dict = {
-            f"cam{cam_idx}_{key}": value
-            for cam_idx in range(num_cams)
-            for key, value in per_cam_weight_dict.items()
-        }
+        if self.use_uncertainty_loss:
+            self.weight_dict = {'loss_uncertainty_total': 1.0}
+        else:
+            self.weight_dict = {
+                f"cam{cam_idx}_{key}": value
+                for cam_idx in range(num_cams)
+                for key, value in per_cam_weight_dict.items()
+            }
 
     def initialize_for_single_clip(self, gt_instances_per_cam: List[List[Instances]]):
         """
@@ -116,6 +127,8 @@ class MultiviewClipMatcher(nn.Module):
             Flat loss dict (losses averaged over cameras).
         """
         aggregated = {}
+        tracking_total = None
+        reid_total = None
         for cam_idx, cam_out in outputs_per_cam.items():
             criterion = self.criteria[cam_idx]
             losses = cam_out.pop("losses_dict")
@@ -124,12 +137,33 @@ class MultiviewClipMatcher(nn.Module):
             # Match ClipMatcher.forward behaviour: normalize per-camera losses first,
             # then optionally compose uncertainty-weighted objective.
             losses = {loss_name: (loss_val / num_samples) for loss_name, loss_val in losses.items()}
-            if criterion.use_uncertainty_loss:
-                losses = criterion._append_uncertainty_loss(losses)
-
-            for loss_name, loss_val in losses.items():
-                key = f"cam{cam_idx}_{loss_name}"
-                aggregated[key] = loss_val
+            if self.use_uncertainty_loss:
+                ref = next(iter(losses.values()), torch.zeros((), device=self.log_var_tracking.device))
+                cam_tracking = ref.new_zeros(())
+                cam_reid = ref.new_zeros(())
+                for loss_name, loss_val in losses.items():
+                    coef = float(criterion.base_weight_dict.get(loss_name, 1.0))
+                    if 'reid' in loss_name.lower():
+                        cam_reid = cam_reid + coef * loss_val
+                    elif any(tok in loss_name.lower() for tok in ('loss_ce', 'loss_bbox', 'loss_giou')):
+                        cam_tracking = cam_tracking + coef * loss_val
+                tracking_total = cam_tracking if tracking_total is None else tracking_total + cam_tracking
+                reid_total = cam_reid if reid_total is None else reid_total + cam_reid
+                for loss_name, loss_val in losses.items():
+                    aggregated[f"cam{cam_idx}_{loss_name}"] = loss_val.detach()
+            else:
+                for loss_name, loss_val in losses.items():
+                    key = f"cam{cam_idx}_{loss_name}"
+                    aggregated[key] = loss_val
+        if self.use_uncertainty_loss and tracking_total is not None:
+            reid_total = reid_total if reid_total is not None else tracking_total.new_zeros(())
+            total = 0.5 * torch.exp(-self.log_var_tracking) * tracking_total
+            if self.reid_enabled:
+                total = total + 0.5 * torch.exp(-self.log_var_reid) * reid_total
+                total = total + 0.5 * (self.log_var_tracking + self.log_var_reid)
+            else:
+                total = total + 0.5 * self.log_var_tracking
+            aggregated['loss_uncertainty_total'] = total
         return aggregated
 
 
@@ -178,6 +212,7 @@ class MultiviewMOTR(nn.Module):
         criterion: MultiviewClipMatcher,
         track_embed,
         num_cams: int = 1,
+        detection_transformer=None,
         aux_loss: bool = True,
         with_box_refine: bool = False,
         two_stage: bool = False,
@@ -191,11 +226,11 @@ class MultiviewMOTR(nn.Module):
         reid_tau2: int = 4,
         reid_label_smoothing: float = 0.1,
         reid_vit_dim: int = 256,
-        reid_num_layers: int = 2,
-        reid_num_heads: int = 8,
+        reid_num_layers: int = 12,
+        reid_num_heads: int = 6,
         reid_dropout: float = 0.1,
         reid_temporal_decay_alpha: float = 1.0,
-        cross_view_reid_match_thresh: float = 0.7,
+        cross_view_reid_match_thresh: float = 0.8,
         cross_view_reid_momentum: float = 0.9,
     ):
         super().__init__()
@@ -203,6 +238,13 @@ class MultiviewMOTR(nn.Module):
         self.num_queries = num_queries
         self.track_embed = track_embed
         self.transformer = transformer
+        self.detection_transformer = detection_transformer
+        if self.detection_transformer is not None:
+            # Start both decoders from identical weights; they become
+            # independent parameters during FusionTrack training.
+            self.detection_transformer.load_state_dict(
+                self.transformer.state_dict(), strict=False
+            )
         self.reid = None
         hidden_dim = transformer.d_model
         self.num_classes = num_classes
@@ -292,9 +334,14 @@ class MultiviewMOTR(nn.Module):
             )
 
         self.use_reid_query = bool(use_reid_query)
+        self.reid_enabled = self.use_reid_query
         self.reid_num_ids = max(1, int(reid_num_ids))
         self.tmp_window_tau1 = max(1, int(reid_tau1))
-        self._reid_obj_to_cls: List[Dict[int, int]] = [dict() for _ in range(num_cams)]
+        # Object IDs from the multiview dataset are shared across cameras.
+        # Keep one map so the same physical target receives one CE label in
+        # every view and in every sampled clip.
+        self._reid_obj_to_cls: Dict[int, int] = {}
+        self._reid_class_owner: Dict[int, int] = {}
         self.reid_queue_bank: Optional[QueueMemoryBank] = None
         self.reid_module: Optional[ReIDQueryModule] = None
         if self.use_reid_query:
@@ -317,6 +364,20 @@ class MultiviewMOTR(nn.Module):
                 view_num=0,
                 sie_xishu=1.0,
             )
+            # The paper leaves L_R configurable.  Keep the pretrained block
+            # widths/heads intact, but honor the requested depth explicitly.
+            requested_layers = max(1, int(reid_num_layers))
+            if hasattr(reid_model.base, 'blocks'):
+                reid_model.base.blocks = nn.ModuleList(
+                    list(reid_model.base.blocks)[:requested_layers]
+                )
+                if reid_model.base.blocks and hasattr(reid_model.base.blocks[0], 'attn'):
+                    actual_heads = int(reid_model.base.blocks[0].attn.num_heads)
+                    if int(reid_num_heads) != actual_heads:
+                        raise ValueError(
+                            f"ReID backbone provides {actual_heads} heads, "
+                            f"but --reid_num_heads={reid_num_heads}."
+                        )
 
             self.reid_module = ReIDQueryModule(
                 reid_model=reid_model,
@@ -324,7 +385,9 @@ class MultiviewMOTR(nn.Module):
                 num_ids=self.reid_num_ids,
                 tau1=max(1, int(reid_tau1)),
                 tau2=max(1, int(reid_tau2)),
-                temporal_decay_alpha=float(reid_temporal_decay_alpha),
+                # Temporal decay is part of the excluded OUM; ReID receives
+                # unweighted query tokens plus frame embeddings.
+                temporal_decay_alpha=1.0,
                 label_smoothing=float(reid_label_smoothing),
             )
             self.reid_queue_bank = QueueMemoryBank(
@@ -385,7 +448,8 @@ class MultiviewMOTR(nn.Module):
             if self.reid_queue_bank is not None:
                 self.reid_queue_bank.clear()
             if self.use_reid_query:
-                self._reid_obj_to_cls = [dict() for _ in range(self.num_cams)]
+                self._reid_obj_to_cls.clear()
+                self._reid_class_owner.clear()
             self._cross_view_local_to_global.clear()
             self._cross_view_global_tracks.clear()
             self._cross_view_global_proto.clear()
@@ -397,8 +461,6 @@ class MultiviewMOTR(nn.Module):
                 self.track_query_queue.clear(cam_idx=cam_idx)
             if self.reid_queue_bank is not None:
                 self.reid_queue_bank.clear(cam_idx=cam_idx)
-            if self.use_reid_query:
-                self._reid_obj_to_cls[cam_idx].clear()
 
             remove_keys = [key for key in self._cross_view_local_to_global if key[0] == cam_idx]
             for key in remove_keys:
@@ -421,24 +483,34 @@ class MultiviewMOTR(nn.Module):
         if len(alive_obj_ids) == 0:
             return None
 
-        id_map = self._reid_obj_to_cls[cam_idx]
+        id_map = self._reid_obj_to_cls
         targets = []
         for obj_id in alive_obj_ids.tolist():
             oid = int(obj_id)
             if oid not in id_map:
-                id_map[oid] = len(id_map) % self.reid_num_ids
+                # Dataset object IDs are globally shared across views.  A
+                # deterministic class assignment keeps DDP ranks aligned.
+                class_id = oid % self.reid_num_ids
+                owner = self._reid_class_owner.get(class_id)
+                if owner is not None and owner != oid:
+                    raise RuntimeError(
+                        f"ReID class collision for object IDs {owner} and {oid}; "
+                        f"increase --reid_num_ids."
+                    )
+                self._reid_class_owner[class_id] = oid
+                id_map[oid] = class_id
             targets.append(id_map[oid])
 
         return torch.as_tensor(targets, dtype=torch.long, device=track_instances.obj_idxes.device)
 
     def _update_track_query_queue(self, track_instances: Instances, cam_idx: int):
-        if self.track_query_queue is None:
-            return
-        self.track_query_queue.push(
-            cam_idx=cam_idx,
-            track_instances=track_instances,
-            frame_id=self._queue_frame_idx[cam_idx],
-        )
+        frame_id = self._queue_frame_idx[cam_idx]
+        if self.track_query_queue is not None:
+            self.track_query_queue.push(
+                cam_idx=cam_idx,
+                track_instances=track_instances,
+                frame_id=frame_id,
+            )
         self._queue_frame_idx[cam_idx] += 1
 
     def get_track_query_queues(self, cam_idx: int = 0):
@@ -567,7 +639,8 @@ class MultiviewMOTR(nn.Module):
                 (len(track_instances),), -1, dtype=torch.long, device=device
             )
 
-            if len(track_instances) == 0 or not track_instances.has('output_embedding'):
+            embedding_field = 'reid_embedding' if track_instances.has('reid_embedding') else 'output_embedding'
+            if len(track_instances) == 0 or not track_instances.has(embedding_field):
                 by_cam[cam_idx] = []
                 continue
 
@@ -581,7 +654,7 @@ class MultiviewMOTR(nn.Module):
                 local_id = int(track_instances.obj_idxes[track_idx].item())
                 local_key = (cam_idx, local_id)
 
-                emb = track_instances.output_embedding[track_idx].detach()
+                emb = track_instances.get(embedding_field)[track_idx].detach()
                 if emb.ndim != 1:
                     emb = emb.flatten()
                 emb = F.normalize(emb, dim=0)
@@ -598,56 +671,95 @@ class MultiviewMOTR(nn.Module):
         if len(candidates) == 0:
             return cross_view_ids
 
-        parent = list(range(len(candidates)))
-
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a: int, b: int):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[rb] = ra
-
-        # Pairwise cosine across cameras (mutual-best + threshold delta).
+        # Build mutual top-k candidate edges, enforcing the paper's
+        # cross-view-only rule before clustering.
         delta = float(self.cross_view_reid_match_thresh)
+        valid_edges: Dict[Tuple[int, int], float] = {}
         cam_ids = sorted(by_cam.keys())
-        for i in range(len(cam_ids)):
-            ca = cam_ids[i]
+        centers = {}
+        for idx, cand in enumerate(candidates):
+            inst = track_instances_by_cam[int(cand['cam_idx'])]
+            ti = int(cand['track_idx'])
+            if inst.has('boxes'):
+                box = inst.boxes[ti]
+                centers[idx] = (float((box[0] + box[2]).item() * 0.5),
+                                float((box[1] + box[3]).item() * 0.5))
+
+        top_k = 10
+        for i, ca in enumerate(cam_ids):
             idx_a = by_cam.get(ca, [])
-            if len(idx_a) == 0:
+            if not idx_a:
                 continue
             emb_a = torch.stack([candidates[idx]['emb'] for idx in idx_a], dim=0)
-
-            for j in range(i + 1, len(cam_ids)):
-                cb = cam_ids[j]
+            for cb in cam_ids[i + 1:]:
                 idx_b = by_cam.get(cb, [])
-                if len(idx_b) == 0:
+                if not idx_b:
                     continue
-
                 emb_b = torch.stack([candidates[idx]['emb'] for idx in idx_b], dim=0)
-                sim = emb_a @ emb_b.t()  # pairwise cosine for L2-normalized features
-
-                best_b_for_a = sim.argmax(dim=1)
-                best_a_for_b = sim.argmax(dim=0)
-
+                sim = emb_a @ emb_b.t()
+                ka = min(top_k, sim.shape[1])
+                kb = min(top_k, sim.shape[0])
+                row_top = torch.topk(sim, ka, dim=1).indices
+                col_top = torch.topk(sim, kb, dim=0).indices
                 for a_pos in range(sim.shape[0]):
-                    b_pos = int(best_b_for_a[a_pos].item())
-                    # Keep only confident mutual-best correspondences.
-                    if int(best_a_for_b[b_pos].item()) != a_pos:
-                        continue
-                    if float(sim[a_pos, b_pos].item()) < delta:
-                        continue
-                    union(idx_a[a_pos], idx_b[b_pos])
+                    for b_pos in row_top[a_pos].tolist():
+                        score = float(sim[a_pos, b_pos].item())
+                        if score < delta:
+                            continue
+                        if a_pos not in col_top[:, b_pos].tolist():
+                            continue
+                        ia, ib = idx_a[a_pos], idx_b[b_pos]
+                        valid_edges[(ia, ib)] = score
 
-        components: Dict[int, List[int]] = {}
-        for idx in range(len(candidates)):
-            root = find(idx)
-            components.setdefault(root, []).append(idx)
+        def neighbors(idx: int) -> List[int]:
+            if idx not in centers:
+                return []
+            cam = int(candidates[idx]['cam_idx'])
+            others = [j for j in by_cam.get(cam, []) if j != idx and j in centers]
+            x, y = centers[idx]
+            return sorted(others, key=lambda j: ((centers[j][0] - x) ** 2 +
+                                                  (centers[j][1] - y) ** 2, j))[:5]
 
-        for member_indices in components.values():
+        def edge_is_valid(a: int, b: int) -> bool:
+            if (a, b) not in valid_edges and (b, a) not in valid_edges:
+                return False
+            na, nb = neighbors(a), neighbors(b)
+            if not na or not nb:
+                return True
+            matched = 0
+            for xa in na:
+                if any((xa, xb) in valid_edges or (xb, xa) in valid_edges for xb in nb):
+                    matched += 1
+            return (matched / float(min(len(na), len(nb)))) > 0.5
+
+        # Mutual-top-k edges are clustered by deterministic complete linkage,
+        # enforcing at most one member from each camera per identity.
+        groups: List[List[int]] = [[idx] for idx in range(len(candidates))]
+        while True:
+            best = None
+            for gi in range(len(groups)):
+                for gj in range(gi + 1, len(groups)):
+                    left, right = groups[gi], groups[gj]
+                    if ({int(candidates[x]['cam_idx']) for x in left} &
+                            {int(candidates[x]['cam_idx']) for x in right}):
+                        continue
+                    pairs = [(a, b) for a in left for b in right]
+                    if not all(edge_is_valid(a, b) for a, b in pairs):
+                        continue
+                    score = min(valid_edges.get((a, b), valid_edges.get((b, a), -1.0))
+                                for a, b in pairs)
+                    key = (score, -min(left + right), -max(left + right))
+                    if best is None or key > best[0]:
+                        best = (key, gi, gj)
+            if best is None:
+                break
+            _, gi, gj = best
+            groups[gi].extend(groups[gj])
+            groups[gi].sort()
+            groups.pop(gj)
+
+        used_gids: set = set()
+        for member_indices in groups:
             comp_emb = torch.stack([candidates[idx]['emb'] for idx in member_indices], dim=0).mean(dim=0)
             comp_emb = F.normalize(comp_emb, dim=0)
 
@@ -657,6 +769,7 @@ class MultiviewMOTR(nn.Module):
                 if local_key in self._cross_view_local_to_global:
                     prior_gids.append(int(self._cross_view_local_to_global[local_key]))
 
+            prior_gids = [g for g in prior_gids if g not in used_gids]
             if len(prior_gids) > 0:
                 gid_votes: Dict[int, int] = {}
                 for gid in prior_gids:
@@ -666,6 +779,8 @@ class MultiviewMOTR(nn.Module):
                 gid = -1
                 best_sim = -1.0
                 for cand_gid, proto in self._cross_view_global_proto.items():
+                    if cand_gid in used_gids:
+                        continue
                     sim = float(torch.dot(comp_emb, proto).item())
                     if sim > best_sim:
                         best_sim = sim
@@ -674,6 +789,8 @@ class MultiviewMOTR(nn.Module):
                 if gid < 0 or best_sim < delta:
                     gid = self._next_cross_view_global_id
                     self._next_cross_view_global_id += 1
+
+            used_gids.add(gid)
 
             for idx in member_indices:
                 cam_idx = int(candidates[idx]['cam_idx'])
@@ -686,9 +803,9 @@ class MultiviewMOTR(nn.Module):
             if gid not in self._cross_view_global_proto:
                 self._cross_view_global_proto[gid] = comp_emb
             else:
-                m = float(self.cross_view_reid_momentum)
-                proto = self._cross_view_global_proto[gid]
-                self._cross_view_global_proto[gid] = F.normalize(m * proto + (1.0 - m) * comp_emb, dim=0)
+                # Keep the latest component descriptor for re-entry lookup;
+                # the paper does not define an EMA prototype update.
+                self._cross_view_global_proto[gid] = comp_emb
 
         return cross_view_ids
 
@@ -748,7 +865,27 @@ class MultiviewMOTR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, track_instances.query_pos, ref_pts=track_instances.ref_pts)
+        query_embed = track_instances.query_pos
+        ref_pts = track_instances.ref_pts
+        detection_hs = None
+        if self.detection_transformer is not None:
+            # FusionTrack's detection decoder runs on fresh queries first.
+            # Its refined query content and reference points seed the tracking
+            # decoder, while carried tracks retain their own query state.
+            det_hs, _, det_refs, _, _ = self.detection_transformer(
+                srcs, masks, pos, self.query_embed.weight, ref_pts=None
+            )
+            detection_hs = det_hs[-1]
+            query_embed = query_embed.clone()
+            fresh = min(self.num_queries, query_embed.shape[0])
+            query_embed[:fresh, query_embed.shape[1] // 2:] = detection_hs[0, :fresh]
+            ref_pts = ref_pts.clone()
+            if det_refs is not None and det_refs.shape[0] > 0:
+                ref_pts[:fresh] = det_refs[-1][0, :fresh]
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
+            srcs, masks, pos, query_embed, ref_pts=ref_pts
+        )
 
         outputs_classes, outputs_coords = [], []
         for lvl in range(hs.shape[0]):
@@ -772,8 +909,22 @@ class MultiviewMOTR(nn.Module):
         out = {
             'pred_logits': outputs_class[-1],
             'pred_boxes': outputs_coord[-1],
-            'ref_pts': ref_pts_all[5],
+            'ref_pts': ref_pts_all[-1],
         }
+        if detection_hs is not None:
+            out['detection_hs'] = detection_hs
+            det_reference = det_refs[-1] if det_refs is not None else self.query_embed.weight.new_zeros(
+                (1, self.num_queries, 2)
+            )
+            det_class_head = self.class_embed[-1] if isinstance(self.class_embed, nn.ModuleList) else self.class_embed
+            det_box_head = self.bbox_embed[-1] if isinstance(self.bbox_embed, nn.ModuleList) else self.bbox_embed
+            det_logits = det_class_head(detection_hs)
+            det_delta = det_box_head(detection_hs)
+            det_delta = det_delta + torch.cat(
+                [inverse_sigmoid(det_reference), torch.zeros_like(det_reference)], dim=-1
+            )
+            out['det_pred_logits'] = det_logits
+            out['det_pred_boxes'] = det_delta.sigmoid()
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
@@ -814,7 +965,7 @@ class MultiviewMOTR(nn.Module):
             if self.training:
                 self.criterion.get_criterion(cam_idx).calc_loss_for_track_scores(track_instances)
 
-        if self.reid_module is not None and self.reid_queue_bank is not None:
+        if self.reid_enabled and self.reid_module is not None and self.reid_queue_bank is not None:
             target_ids = self._build_reid_target_ids(cam_idx, track_instances) if self.training else None
             reid_frame_idx = self._queue_frame_idx[cam_idx] if global_frame_idx is None else int(global_frame_idx)
             track_instances, reid_loss = self.reid_module(
@@ -824,6 +975,10 @@ class MultiviewMOTR(nn.Module):
                 global_frame_idx=reid_frame_idx,
                 target_ids=target_ids,
             )
+
+            if self.training and self.reid_module.last_raw_features is not None:
+                self._clip_reid_features.append(self.reid_module.last_raw_features)
+                self._clip_reid_targets.append(self.reid_module.last_target_ids)
 
             if self.training and reid_loss is not None:
                 criterion_cam = self.criterion.get_criterion(cam_idx)
@@ -884,25 +1039,39 @@ class MultiviewMOTR(nn.Module):
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
                     frame_res = self._forward_single_image(frame, tmp)
-                    return (
-                        frame_res['pred_logits'],
-                        frame_res['pred_boxes'],
-                        frame_res['ref_pts'],
-                        frame_res['hs'],
-                        *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
-                        *[aux['pred_boxes'] for aux in frame_res['aux_outputs']],
-                    )
+                    base = [
+                        frame_res['pred_logits'], frame_res['pred_boxes'],
+                        frame_res['ref_pts'], frame_res['hs'],
+                    ]
+                    if self.detection_transformer is not None:
+                        base.extend([
+                            frame_res['det_pred_logits'],
+                            frame_res['det_pred_boxes'],
+                        ])
+                    aux = frame_res.get('aux_outputs', [])
+                    return tuple(base +
+                                 [a['pred_logits'] for a in aux] +
+                                 [a['pred_boxes'] for a in aux])
 
                 args = [frame] + [track_instances.get(k) for k in keys]
                 params = tuple(p for p in self.parameters() if p.requires_grad)
                 tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
+                num_aux = len(self.transformer.decoder.layers) - 1
+                aux_offset = 6 if self.detection_transformer is not None else 4
                 frame_res = {
                     'pred_logits': tmp[0],
                     'pred_boxes': tmp[1],
                     'ref_pts': tmp[2],
                     'hs': tmp[3],
-                    'aux_outputs': [{'pred_logits': tmp[4 + i], 'pred_boxes': tmp[4 + 5 + i]} for i in range(5)],
+                    'aux_outputs': [
+                        {'pred_logits': tmp[aux_offset + i],
+                         'pred_boxes': tmp[aux_offset + num_aux + i]}
+                        for i in range(num_aux)
+                    ],
                 }
+                if self.detection_transformer is not None:
+                    frame_res['det_pred_logits'] = tmp[4]
+                    frame_res['det_pred_boxes'] = tmp[5]
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances)
@@ -1062,6 +1231,8 @@ class MultiviewMOTR(nn.Module):
             f"Expected {self.num_cams} cameras, got {len(imgs_per_cam)}"
 
         self.criterion.initialize_for_single_clip(gt_per_cam)
+        self._clip_reid_features = []
+        self._clip_reid_targets = []
 
         outputs_per_cam: Dict[int, dict] = {}
         for cam_idx in range(self.num_cams):
@@ -1074,6 +1245,22 @@ class MultiviewMOTR(nn.Module):
             cam_outputs['losses_dict'] = self.criterion.get_criterion(cam_idx).losses_dict
             outputs_per_cam[cam_idx] = cam_outputs
 
+        # Individual camera batches usually contain one sample per identity,
+        # which makes batch-hard triplet loss degenerate.  Mine positives from
+        # synchronized camera/temporal outputs while they are still connected
+        # to the current-frame tracking graph.
+        if self.reid_module is not None and self._clip_reid_features:
+            feature_batches = [f for f in self._clip_reid_features if f is not None]
+            target_batches = [t for t in self._clip_reid_targets if t is not None]
+            if feature_batches and target_batches:
+                features = torch.cat(feature_batches, dim=0)
+                targets = torch.cat(target_batches, dim=0)
+                if len(features) > 1 and (targets.unique().numel() > 1):
+                    cross_view_triplet = _batch_hard_triplet_loss(
+                        F.normalize(features, p=2, dim=1), targets, margin=0.3
+                    )
+                    outputs_per_cam[0]['losses_dict']['clip_reid_triplet'] = cross_view_triplet
+
         losses = self.criterion(outputs_per_cam)
         return {'losses_dict': losses}
 
@@ -1083,6 +1270,8 @@ class MultiviewMOTR(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build(args):
+    if getattr(args, 'meta_arch', '') == 'fusiontrack_motr' and args.two_stage:
+        raise ValueError('fusiontrack_motr requires one-stage query initialization')
     dataset_to_num_classes = {
         'coco': 91,
         'coco_panoptic': 250,
@@ -1101,6 +1290,9 @@ def build(args):
 
     backbone = build_backbone(args)
     transformer = build_deforamble_transformer(args)
+    detection_transformer = None
+    if getattr(args, 'meta_arch', '') == 'fusiontrack_motr':
+        detection_transformer = build_deforamble_transformer(args)
     d_model = transformer.d_model
     hidden_dim = args.dim_feedforward
     query_interaction_layer = build_query_interaction_layer(
@@ -1122,6 +1314,9 @@ def build(args):
             f"frame_{i}_loss_ce":   args.cls_loss_coef,
             f"frame_{i}_loss_bbox": args.bbox_loss_coef,
             f"frame_{i}_loss_giou": args.giou_loss_coef,
+            f"frame_{i}_det_loss_ce":   args.cls_loss_coef,
+            f"frame_{i}_det_loss_bbox": args.bbox_loss_coef,
+            f"frame_{i}_det_loss_giou": args.giou_loss_coef,
         })
     if args.aux_loss:
         for i in range(num_frames_per_batch):
@@ -1133,6 +1328,7 @@ def build(args):
                 })
 
     if getattr(args, 'use_reid_query', False):
+        weight_dict['clip_reid_triplet'] = args.reid_loss_coef
         for i in range(num_frames_per_batch):
             weight_dict.update({f"frame_{i}_reid_total": args.reid_loss_coef})
 
@@ -1170,6 +1366,7 @@ def build(args):
     model = MultiviewMOTR(
         backbone=backbone,
         transformer=transformer,
+        detection_transformer=detection_transformer,
         num_classes=num_classes,
         num_queries=args.num_queries,
         num_feature_levels=args.num_feature_levels,
@@ -1189,11 +1386,11 @@ def build(args):
         reid_tau2=getattr(args, 'reid_tau2', 4),
         reid_label_smoothing=getattr(args, 'reid_label_smoothing', 0.1),
         reid_vit_dim=getattr(args, 'reid_vit_dim', hidden_dim),
-        reid_num_layers=getattr(args, 'reid_num_layers', 2),
-        reid_num_heads=getattr(args, 'reid_num_heads', 8),
+        reid_num_layers=getattr(args, 'reid_num_layers', 12),
+        reid_num_heads=getattr(args, 'reid_num_heads', 6),
         reid_dropout=getattr(args, 'reid_dropout', 0.1),
         reid_temporal_decay_alpha=getattr(args, 'reid_temporal_decay_alpha', 1.0),
-        cross_view_reid_match_thresh=getattr(args, 'cross_view_reid_match_thresh', 0.7),
+        cross_view_reid_match_thresh=getattr(args, 'cross_view_reid_match_thresh', 0.8),
         cross_view_reid_momentum=getattr(args, 'cross_view_reid_momentum', 0.9),
     )
     model.to(device)

@@ -167,6 +167,8 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--num_workers', default=1, type=int)
+    parser.add_argument('--smoke_train', action='store_true', default=False,
+                        help='Use a small image scale for a one-batch smoke run')
     parser.add_argument('--pretrained', default=None, help='resume from checkpoint')
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
@@ -218,18 +220,20 @@ def get_args_parser():
                         help='Label smoothing used in ReID CE loss')
     parser.add_argument('--reid_vit_dim', type=int, default=256,
                         help='Internal feature dim of lightweight ReID transformer')
-    parser.add_argument('--reid_num_layers', type=int, default=2,
+    parser.add_argument('--reid_num_layers', type=int, default=12,
                         help='Number of transformer layers in lightweight ReID backbone')
-    parser.add_argument('--reid_num_heads', type=int, default=8,
+    parser.add_argument('--reid_num_heads', type=int, default=6,
                         help='Attention heads in lightweight ReID backbone')
     parser.add_argument('--reid_dropout', type=float, default=0.1,
                         help='Dropout in lightweight ReID backbone')
+    parser.add_argument('--reid_warmup_epochs', type=int, default=20,
+                        help='Tracking-only warmup before enabling the ReID objective')
     parser.add_argument('--reid_temporal_decay_alpha', type=float, default=1.0,
-                        help='Temporal decay alpha in [0,1] for ReID queue tokens; 1.0 disables decay, 0.5 emphasizes current frame')
+                        help='Deprecated OUM decay parameter; ignored by the OUM-free FusionTrack path')
     parser.add_argument('--cross_view_reid_match_thresh', type=float, default=0.8,
                         help='Cosine similarity threshold for linking identities across cameras at inference')
     parser.add_argument('--cross_view_reid_momentum', type=float, default=0.9,
-                        help='EMA momentum for cross-view ReID global prototype updates')
+                        help='Deprecated compatibility option; latest descriptors are used for re-entry')
 
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
 
@@ -262,8 +266,8 @@ def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
 
-    if args.dataset_file == 'e2e_mv_mot' and args.meta_arch != 'multiview_motr':
-        print("Warning: dataset_file=e2e_mv_mot requires meta_arch=multiview_motr. Overriding meta_arch.")
+    if args.dataset_file == 'e2e_mv_mot' and args.meta_arch not in ('multiview_motr', 'fusiontrack_motr'):
+        print("Warning: dataset_file=e2e_mv_mot requires a multiview architecture. Overriding meta_arch.")
         args.meta_arch = 'multiview_motr'
 
     if args.frozen_weights is not None:
@@ -391,6 +395,10 @@ def main(args):
 
     if args.pretrained is not None:
         model_without_ddp = load_model(model_without_ddp, args.pretrained)
+        if hasattr(model_without_ddp, 'detection_transformer') and model_without_ddp.detection_transformer is not None:
+            model_without_ddp.detection_transformer.load_state_dict(
+                model_without_ddp.transformer.state_dict(), strict=False
+            )
 
     output_dir = Path(args.output_dir)
     if args.resume:
@@ -405,6 +413,13 @@ def main(args):
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
+        if 'reid_identity_map' in checkpoint and hasattr(model_without_ddp, '_reid_obj_to_cls'):
+            model_without_ddp._reid_obj_to_cls = {
+                int(k): int(v) for k, v in checkpoint['reid_identity_map'].items()
+            }
+            model_without_ddp._reid_class_owner = {
+                int(v): int(k) for k, v in model_without_ddp._reid_obj_to_cls.items()
+            }
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -446,6 +461,13 @@ def main(args):
         dataset_train.set_epoch(args.start_epoch)
         dataset_val.set_epoch(args.start_epoch)
     for epoch in range(args.start_epoch, args.epochs):
+        # FusionTrack warms up single-view tracking before enabling the
+        # cross-view ReID objective, matching the paper's progressive setup.
+        model_for_schedule = model.module if hasattr(model, 'module') else model
+        if getattr(model_for_schedule, 'use_reid_query', False):
+            model_for_schedule.reid_enabled = epoch >= getattr(args, 'reid_warmup_epochs', 20)
+            if hasattr(model_for_schedule, 'criterion'):
+                model_for_schedule.criterion.reid_enabled = model_for_schedule.reid_enabled
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_func(
@@ -478,6 +500,11 @@ def main(args):
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
+                    'reid_identity_map': {
+                        str(k): int(v) for k, v in getattr(
+                            model_without_ddp, '_reid_obj_to_cls', {}
+                        ).items()
+                    },
                 }, checkpoint_path)
         
         if args.dataset_file not in MOT_LIKE_DATASETS:

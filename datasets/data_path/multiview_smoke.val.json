@@ -2,7 +2,7 @@
   "scenes": [
     {
       "name": "scene_001",
-      "cameras": ["camera_0", "camera_1"],
+      "cameras": ["camera_0", "camera_1", "camera_2", "camera_3", "camera_4", "camera_5", "camera_6"],
       "start_frame": 1,
       "num_frames": 1
     }

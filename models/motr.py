@@ -378,6 +378,24 @@ class ClipMatcher(SetCriterion):
         # step8. calculate losses.
         self.num_samples += len(gt_instances_i) + num_disappear_track
         self.sample_device = pred_logits_i.device
+        if 'det_pred_logits' in outputs_without_aux:
+            det_outputs = {
+                'pred_logits': outputs_without_aux['det_pred_logits'],
+                'pred_boxes': outputs_without_aux['det_pred_boxes'],
+            }
+            det_indices = self.matcher(det_outputs, [gt_instances_i])
+            for loss in self.losses:
+                det_loss = self.get_loss(
+                    loss,
+                    outputs=det_outputs,
+                    gt_instances=[gt_instances_i],
+                    indices=det_indices,
+                    num_boxes=1,
+                )
+                self.losses_dict.update({
+                    'frame_{}_det_{}'.format(self._current_frame_idx, key): value
+                    for key, value in det_loss.items()
+                })
         for loss in self.losses:
             new_track_loss = self.get_loss(loss,
                                            outputs=outputs_i,

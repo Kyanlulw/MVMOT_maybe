@@ -17,6 +17,7 @@ def build_model(args):
         'deformable_detr': build_deformable_detr,
         'motr': build_motr,
         'multiview_motr': build_multiview_motr,
+        'fusiontrack_motr': build_multiview_motr,
     }
     assert args.meta_arch in arch_catalog, 'invalid arch: {}'.format(args.meta_arch)
     build_func = arch_catalog[args.meta_arch]

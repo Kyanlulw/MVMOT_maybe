@@ -147,6 +147,17 @@ sh configs/r50_motr_train.sh
 
 ```
 
+#### Seven-camera FusionTrack smoke run
+
+The repository includes a tiny seven-camera fixture and a one-epoch launcher for checking the full FusionTrack path (detection decoder, tracking decoder, ReID query, uncertainty loss, and checkpointing):
+
+```bash
+cd MOTR
+bash configs/r50_multiview_motr_smoke.sh
+```
+
+The smoke fixture is intentionally made by repeating the two sample views across seven camera directories. It validates wiring and backpropagation only; use the WildTrack launcher for real training.
+
 #### Evaluation on MOT15
 
 You can download the pretrained model of MOTR (the link is in "Main Results" session), then run following command to evaluate it on MOT15 train dataset:
