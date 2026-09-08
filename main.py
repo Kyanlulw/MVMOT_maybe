@@ -342,6 +342,9 @@ def get_args_parser():
                         help='Deprecated OUM decay parameter; ignored by the OUM-free FusionTrack path')
     parser.add_argument('--cross_view_reid_match_thresh', type=float, default=0.8,
                         help='Cosine similarity threshold for linking identities across cameras at inference')
+    parser.add_argument('--cross_view_top_k', type=int, default=10)
+    parser.add_argument('--cross_view_spatial_neighbors', type=int, default=5)
+    parser.add_argument('--cross_view_neighbor_thresh', type=float, default=0.5)
     parser.add_argument('--cross_view_reid_momentum', type=float, default=0.9,
                         help='Deprecated compatibility option; latest descriptors are used for re-entry')
 

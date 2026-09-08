@@ -22,7 +22,6 @@ from main import get_args_parser
 from models import build_model
 from models.structures import Instances
 from util.misc import NestedTensor, nested_tensor_from_tensor_list
-from util.tool import load_model
 import datasets.transforms as T
 
 
@@ -57,20 +56,28 @@ def discover_camera_names(scene_dir):
 
 def collect_frame_files(scene_dir, camera_names):
     """Return sorted frame-file lists per camera and synchronized frame count."""
-    frame_files_by_cam = {}
-    min_frames = None
+    # Frame stems are synchronized timestamps, not positions in directory lists.
+    # Reject gaps instead of silently pairing different timestamps or compressing
+    # elapsed time in the TMP window.
+    indexed = {}
     for cam in camera_names:
-        img_dir = osp.join(scene_dir, cam, 'images')
-        img_files = sorted([
-            f for f in os.listdir(img_dir)
-            if f.lower().endswith(('.jpg', '.png', '.jpeg'))
-        ])
-        frame_files_by_cam[cam] = img_files
-        if min_frames is None:
-            min_frames = len(img_files)
-        else:
-            min_frames = min(min_frames, len(img_files))
-    return frame_files_by_cam, (0 if min_frames is None else min_frames)
+        files = {}
+        for name in os.listdir(osp.join(scene_dir, cam, 'images')):
+            if not name.lower().endswith(('.jpg', '.png', '.jpeg')):
+                continue
+            stem = Path(name).stem
+            key = int(stem) if stem.isdecimal() else stem
+            if key in files:
+                raise ValueError(f'Duplicate frame identifier {stem} in {cam}')
+            files[key] = name
+        indexed[cam] = files
+    if not indexed:
+        return {}, 0
+    keys = set(indexed[camera_names[0]])
+    if any(set(files) != keys for files in indexed.values()):
+        raise ValueError('Camera frame identifiers differ. Supply synchronized frames with matching stems.')
+    ordered = sorted(keys, key=lambda key: (isinstance(key, str), key))
+    return {cam: [files[key] for key in ordered] for cam, files in indexed.items()}, len(ordered)
 
 
 def load_multiview_frames(scene_dir, camera_names, frame_files_by_cam, frame_idx):
@@ -92,7 +99,7 @@ def load_multiview_frames(scene_dir, camera_names, frame_files_by_cam, frame_idx
         img_files = frame_files_by_cam[cam]
         if frame_idx < len(img_files):
             img_path = osp.join(img_dir, img_files[frame_idx])
-            img = Image.open(img_path)
+            img = Image.open(img_path).convert('RGB')
             ori_sizes.append(img.size[::-1])  # (h, w)
             images.append(img)
     return images, ori_sizes
@@ -231,7 +238,7 @@ def create_video_writer(output_video, frame_size, fps=30):
 
 def main():
     parser = argparse.ArgumentParser('Multi-View MOTR Demo', parents=[get_args_parser()])
-    parser.set_defaults(use_reid_query=True)
+    parser.set_defaults(use_reid_query=True, meta_arch='fusiontrack_motr')
     parser.add_argument('--scene_dir', type=str, required=True,
                        help='Path to the scene directory with camera subdirectories')
     parser.add_argument('--camera_names', type=str, nargs='*', default=None,
@@ -250,8 +257,19 @@ def main():
                        help='Disable ReID query branch during demo inference')
     args = parser.parse_args()
 
-    # Override some args for demo
-    args.meta_arch = 'multiview_motr'
+    checkpoint = None
+    if args.resume:
+        # Training checkpoints contain argparse.Namespace metadata; load only
+        # checkpoints from a trusted source. Explicit CLI flags override metadata.
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        saved_args = checkpoint.get('args')
+        if saved_args is not None:
+            saved_args = saved_args if isinstance(saved_args, dict) else vars(saved_args)
+            parser.set_defaults(**saved_args)
+            args = parser.parse_args()
+    if args.meta_arch not in ('fusiontrack_motr', 'multiview_motr'):
+        raise ValueError('Multiview inference requires fusiontrack_motr or multiview_motr')
+    # Camera count is a property of the input scene.
     args.dataset_file = 'e2e_mv_mot'
     if args.camera_names is None or len(args.camera_names) == 0:
         args.camera_names = discover_camera_names(args.scene_dir)
@@ -272,9 +290,12 @@ def main():
     model.eval()
 
     # Load weights
-    if args.resume:
-        model = load_model(model, args.resume)
-        print(f"Loaded model from {args.resume}")
+    if checkpoint is not None:
+        # Inference must not silently drop a trained decoder or substitute random
+        # weights, as the permissive pretraining loader intentionally can.
+        model.load_state_dict(checkpoint['model'], strict=True)
+        print(f"Loaded {args.meta_arch} from {args.resume}")
+        del checkpoint
 
     # Setup transforms
     transforms = make_inference_transforms()

@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import List, Dict, Optional, Tuple
 
+from .association import mutual_topk_edges, neighbor_support
+
 from util import box_ops
 from torch.utils.checkpoint import checkpoint
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -237,6 +239,9 @@ class MultiviewMOTR(nn.Module):
         reid_temporal_decay_alpha: float = 1.0,
         cross_view_reid_match_thresh: float = 0.8,
         cross_view_reid_momentum: float = 0.9,
+        cross_view_top_k: int = 10,
+        cross_view_spatial_neighbors: int = 5,
+        cross_view_neighbor_thresh: float = 0.5,
     ):
         super().__init__()
         self.num_cams = num_cams
@@ -408,6 +413,13 @@ class MultiviewMOTR(nn.Module):
         # Cross-view ReID state (inference-time global identity association).
         self.cross_view_reid_match_thresh = float(cross_view_reid_match_thresh)
         self.cross_view_reid_momentum = float(cross_view_reid_momentum)
+        self.cross_view_top_k = int(cross_view_top_k)
+        self.cross_view_spatial_neighbors = int(cross_view_spatial_neighbors)
+        self.cross_view_neighbor_thresh = float(cross_view_neighbor_thresh)
+        if self.cross_view_top_k < 1 or self.cross_view_spatial_neighbors < 1:
+            raise ValueError('Cross-view neighbor counts must be positive')
+        if not 0 <= self.cross_view_neighbor_thresh <= 1:
+            raise ValueError('Cross-view neighbor threshold must be in [0, 1]')
         self._cross_view_local_to_global: Dict[Tuple[int, int], int] = {}
         self._cross_view_global_tracks: Dict[int, List[Tuple[int, int]]] = {}
         self._cross_view_global_proto: Dict[int, Tensor] = {}
@@ -636,13 +648,13 @@ class MultiviewMOTR(nn.Module):
         return status
 
     def _associate_cross_view_reid(self, track_instances_by_cam: Dict[int, Instances]) -> Dict[int, Tensor]:
-        """Assign global IDs via pairwise cosine matching across cameras + temporal prototype updates."""
+        """Apply global mutual top-k/NFM/VHC, then reconcile persistent TMP IDs."""
         cross_view_ids: Dict[int, Tensor] = {}
 
         candidates: List[Dict[str, object]] = []
         by_cam: Dict[int, List[int]] = {}
 
-        for cam_idx, track_instances in track_instances_by_cam.items():
+        for cam_idx, track_instances in sorted(track_instances_by_cam.items()):
             device = track_instances.obj_idxes.device
             cross_view_ids[cam_idx] = torch.full(
                 (len(track_instances),), -1, dtype=torch.long, device=device
@@ -683,8 +695,6 @@ class MultiviewMOTR(nn.Module):
         # Build mutual top-k candidate edges, enforcing the paper's
         # cross-view-only rule before clustering.
         delta = float(self.cross_view_reid_match_thresh)
-        valid_edges: Dict[Tuple[int, int], float] = {}
-        cam_ids = sorted(by_cam.keys())
         centers = {}
         for idx, cand in enumerate(candidates):
             inst = track_instances_by_cam[int(cand['cam_idx'])]
@@ -694,31 +704,11 @@ class MultiviewMOTR(nn.Module):
                 centers[idx] = (float((box[0] + box[2]).item() * 0.5),
                                 float((box[1] + box[3]).item() * 0.5))
 
-        top_k = 10
-        for i, ca in enumerate(cam_ids):
-            idx_a = by_cam.get(ca, [])
-            if not idx_a:
-                continue
-            emb_a = torch.stack([candidates[idx]['emb'] for idx in idx_a], dim=0)
-            for cb in cam_ids[i + 1:]:
-                idx_b = by_cam.get(cb, [])
-                if not idx_b:
-                    continue
-                emb_b = torch.stack([candidates[idx]['emb'] for idx in idx_b], dim=0)
-                sim = emb_a @ emb_b.t()
-                ka = min(top_k, sim.shape[1])
-                kb = min(top_k, sim.shape[0])
-                row_top = torch.topk(sim, ka, dim=1).indices
-                col_top = torch.topk(sim, kb, dim=0).indices
-                for a_pos in range(sim.shape[0]):
-                    for b_pos in row_top[a_pos].tolist():
-                        score = float(sim[a_pos, b_pos].item())
-                        if score < delta:
-                            continue
-                        if a_pos not in col_top[:, b_pos].tolist():
-                            continue
-                        ia, ib = idx_a[a_pos], idx_b[b_pos]
-                        valid_edges[(ia, ib)] = score
+        valid_edges = mutual_topk_edges(
+            torch.stack([cand['emb'] for cand in candidates]),
+            [int(cand['cam_idx']) for cand in candidates],
+            self.cross_view_top_k, delta,
+        )
 
         def neighbors(idx: int) -> List[int]:
             if idx not in centers:
@@ -727,7 +717,7 @@ class MultiviewMOTR(nn.Module):
             others = [j for j in by_cam.get(cam, []) if j != idx and j in centers]
             x, y = centers[idx]
             return sorted(others, key=lambda j: ((centers[j][0] - x) ** 2 +
-                                                  (centers[j][1] - y) ** 2, j))[:5]
+                                                  (centers[j][1] - y) ** 2, j))[:self.cross_view_spatial_neighbors]
 
         def edge_is_valid(a: int, b: int) -> bool:
             if (a, b) not in valid_edges and (b, a) not in valid_edges:
@@ -735,11 +725,7 @@ class MultiviewMOTR(nn.Module):
             na, nb = neighbors(a), neighbors(b)
             if not na or not nb:
                 return True
-            matched = 0
-            for xa in na:
-                if any((xa, xb) in valid_edges or (xb, xa) in valid_edges for xb in nb):
-                    matched += 1
-            return (matched / float(min(len(na), len(nb)))) > 0.5
+            return neighbor_support(na, nb, valid_edges) > self.cross_view_neighbor_thresh
 
         # Mutual-top-k edges are clustered by deterministic complete linkage,
         # enforcing at most one member from each camera per identity.
@@ -767,7 +753,16 @@ class MultiviewMOTR(nn.Module):
             groups[gi].sort()
             groups.pop(gj)
 
+        # Reserve identities of continuing tracks before processing newcomers.
+        # Otherwise an early new component can steal a later track's identity.
+        reserved_gids = {self._cross_view_local_to_global[c['local_key']]
+                         for c in candidates if c['local_key'] in self._cross_view_local_to_global}
+        groups.sort(key=lambda group: (
+            -sum(candidates[i]['local_key'] in self._cross_view_local_to_global for i in group),
+            min(group),
+        ))
         used_gids: set = set()
+        assigned_cameras: Dict[int, set] = {}
         for member_indices in groups:
             comp_emb = torch.stack([candidates[idx]['emb'] for idx in member_indices], dim=0).mean(dim=0)
             comp_emb = F.normalize(comp_emb, dim=0)
@@ -778,7 +773,11 @@ class MultiviewMOTR(nn.Module):
                 if local_key in self._cross_view_local_to_global:
                     prior_gids.append(int(self._cross_view_local_to_global[local_key]))
 
-            prior_gids = [g for g in prior_gids if g not in used_gids]
+            component_cameras = {int(candidates[i]['cam_idx']) for i in member_indices}
+            # A temporary appearance mismatch must not split an established ID
+            # across disjoint views; same-view collisions still get separate IDs.
+            prior_gids = [g for g in prior_gids
+                          if not component_cameras & assigned_cameras.get(g, set())]
             if len(prior_gids) > 0:
                 gid_votes: Dict[int, int] = {}
                 for gid in prior_gids:
@@ -788,7 +787,7 @@ class MultiviewMOTR(nn.Module):
                 gid = -1
                 best_sim = -1.0
                 for cand_gid, proto in self._cross_view_global_proto.items():
-                    if cand_gid in used_gids:
+                    if cand_gid in used_gids or cand_gid in reserved_gids:
                         continue
                     sim = float(torch.dot(comp_emb, proto).item())
                     if sim > best_sim:
@@ -800,13 +799,26 @@ class MultiviewMOTR(nn.Module):
                     self._next_cross_view_global_id += 1
 
             used_gids.add(gid)
+            assigned_cameras.setdefault(gid, set()).update(component_cameras)
 
             for idx in member_indices:
                 cam_idx = int(candidates[idx]['cam_idx'])
                 track_idx = int(candidates[idx]['track_idx'])
                 local_key = candidates[idx]['local_key']
                 self._cross_view_local_to_global[local_key] = gid
-                self._cross_view_global_tracks.setdefault(gid, []).append(local_key)
+                # Keep membership consistent and bounded when IDs are reassigned.
+                old_gid = next((g for g, pairs in self._cross_view_global_tracks.items()
+                                if g != gid and local_key in pairs), None)
+                if old_gid is not None:
+                    self._cross_view_global_tracks[old_gid] = [
+                        key for key in self._cross_view_global_tracks[old_gid] if key != local_key]
+                    self._tmp_track_state.pop((cam_idx, old_gid), None)
+                    if not self._cross_view_global_tracks[old_gid]:
+                        self._cross_view_global_tracks.pop(old_gid)
+                        self._cross_view_global_proto.pop(old_gid, None)
+                members = self._cross_view_global_tracks.setdefault(gid, [])
+                if local_key not in members:
+                    members.append(local_key)
                 cross_view_ids[cam_idx][track_idx] = gid
 
             if gid not in self._cross_view_global_proto:
@@ -1009,6 +1021,13 @@ class MultiviewMOTR(nn.Module):
             'init_track_instances': self._generate_empty_tracks(),
             'track_instances': track_instances,
         }
+        # Instances.cat retains only fields present in its first argument.
+        # Seed the fresh-query field or QIM silently drops the learned ReID
+        # descriptors before inference association sees them.
+        if track_instances.has('reid_embedding'):
+            tmp['init_track_instances'].reid_embedding = track_instances.reid_embedding.new_zeros(
+                (len(tmp['init_track_instances']), track_instances.reid_embedding.shape[-1])
+            )
         if not is_last:
             out_track_instances = self.track_embed(tmp)
             frame_res['track_instances'] = out_track_instances
@@ -1107,7 +1126,7 @@ class MultiviewMOTR(nn.Module):
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
         if track_instances is None:
-            self._reset_track_query_queue(cam_idx)
+            self.clear(cam_idx)
             track_instances = self._generate_empty_tracks()
 
         res = self._forward_single_image(img, track_instances)
@@ -1149,6 +1168,7 @@ class MultiviewMOTR(nn.Module):
         assert len(ori_img_sizes) == self.num_cams, f"Expected {self.num_cams} image sizes, got {len(ori_img_sizes)}"
 
         if track_instances_list is None:
+            self.clear()
             track_instances_list = [None] * self.num_cams
         else:
             assert len(track_instances_list) == self.num_cams, \
@@ -1165,7 +1185,7 @@ class MultiviewMOTR(nn.Module):
 
             track_instances = track_instances_list[cam_idx]
             if track_instances is None:
-                self._reset_track_query_queue(cam_idx)
+                self.clear(cam_idx)
                 track_instances = self._generate_empty_tracks()
 
             res = self._forward_single_image(img, track_instances)
@@ -1378,6 +1398,9 @@ def build(args):
         reid_temporal_decay_alpha=getattr(args, 'reid_temporal_decay_alpha', 1.0),
         cross_view_reid_match_thresh=getattr(args, 'cross_view_reid_match_thresh', 0.8),
         cross_view_reid_momentum=getattr(args, 'cross_view_reid_momentum', 0.9),
+        cross_view_top_k=getattr(args, 'cross_view_top_k', 10),
+        cross_view_spatial_neighbors=getattr(args, 'cross_view_spatial_neighbors', 5),
+        cross_view_neighbor_thresh=getattr(args, 'cross_view_neighbor_thresh', 0.5),
     )
     model.to(device)
 
