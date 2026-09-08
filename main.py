@@ -395,10 +395,6 @@ def main(args):
 
     if args.pretrained is not None:
         model_without_ddp = load_model(model_without_ddp, args.pretrained)
-        if hasattr(model_without_ddp, 'detection_transformer') and model_without_ddp.detection_transformer is not None:
-            model_without_ddp.detection_transformer.load_state_dict(
-                model_without_ddp.transformer.state_dict(), strict=False
-            )
 
     output_dir = Path(args.output_dir)
     if args.resume:
@@ -478,7 +474,7 @@ def main(args):
         )
         if not scheduler_step_per_iter:
             if args.lr_scheduler == 'cosine':
-                if (epoch + 1) >= cosine_start_epoch:
+                if epoch >= cosine_start_epoch:
                     lr_scheduler.step()
             else:
                 lr_scheduler.step()

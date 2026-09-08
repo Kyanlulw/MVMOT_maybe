@@ -26,7 +26,8 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import List, Dict, Optional, Tuple
 
-from util import box_ops, checkpoint
+from util import box_ops
+from torch.utils.checkpoint import checkpoint
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate, get_rank,
                        is_dist_avail_and_initialized, inverse_sigmoid)
@@ -142,7 +143,11 @@ class MultiviewClipMatcher(nn.Module):
                 cam_tracking = ref.new_zeros(())
                 cam_reid = ref.new_zeros(())
                 for loss_name, loss_val in losses.items():
-                    coef = float(criterion.base_weight_dict.get(loss_name, 1.0))
+                    # Component metrics are logged, but only objective keys
+                    # contribute gradients (ReID total already includes CE).
+                    if loss_name not in criterion.base_weight_dict:
+                        continue
+                    coef = float(criterion.base_weight_dict[loss_name])
                     if 'reid' in loss_name.lower():
                         cam_reid = cam_reid + coef * loss_val
                     elif any(tok in loss_name.lower() for tok in ('loss_ce', 'loss_bbox', 'loss_giou')):
@@ -245,6 +250,10 @@ class MultiviewMOTR(nn.Module):
             self.detection_transformer.load_state_dict(
                 self.transformer.state_dict(), strict=False
             )
+            # Detection and tracking decode one shared encoder result.
+            # Keep decoder checkpoint names, without unused encoder parameters.
+            del self.detection_transformer.encoder
+            del self.detection_transformer.level_embed
         self.reid = None
         hidden_dim = transformer.d_model
         self.num_classes = num_classes
@@ -868,12 +877,13 @@ class MultiviewMOTR(nn.Module):
         query_embed = track_instances.query_pos
         ref_pts = track_instances.ref_pts
         detection_hs = None
+        encoded = self.transformer.encode(srcs, masks, pos)
         if self.detection_transformer is not None:
             # FusionTrack's detection decoder runs on fresh queries first.
             # Its refined query content and reference points seed the tracking
             # decoder, while carried tracks retain their own query state.
-            det_hs, _, det_refs, _, _ = self.detection_transformer(
-                srcs, masks, pos, self.query_embed.weight, ref_pts=None
+            det_hs, _, det_refs, _, _ = self.detection_transformer.decode(
+                encoded, self.query_embed.weight, ref_pts=None
             )
             detection_hs = det_hs[-1]
             query_embed = query_embed.clone()
@@ -881,10 +891,10 @@ class MultiviewMOTR(nn.Module):
             query_embed[:fresh, query_embed.shape[1] // 2:] = detection_hs[0, :fresh]
             ref_pts = ref_pts.clone()
             if det_refs is not None and det_refs.shape[0] > 0:
-                ref_pts[:fresh] = det_refs[-1][0, :fresh]
+                ref_pts[:fresh] = inverse_sigmoid(det_refs[-1][0, :fresh])
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
-            srcs, masks, pos, query_embed, ref_pts=ref_pts
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer.decode(
+            encoded, query_embed, ref_pts=ref_pts
         )
 
         outputs_classes, outputs_coords = [], []
@@ -1025,7 +1035,6 @@ class MultiviewMOTR(nn.Module):
         """
         outputs = {'pred_logits': [], 'pred_boxes': []}
         track_instances = self._generate_empty_tracks()
-        keys = list(track_instances._fields.keys())
 
         for frame_index, frame in enumerate(frames):
             frame.requires_grad = False
@@ -1034,44 +1043,21 @@ class MultiviewMOTR(nn.Module):
             if global_frame_idxs is not None and frame_index < len(global_frame_idxs):
                 frame_global_idx = int(global_frame_idxs[frame_index])
 
-            if self.use_checkpoint and frame_index < len(frames) - 2:
-                def fn(frame, *args):
-                    frame = nested_tensor_from_tensor_list([frame])
-                    tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, tmp)
-                    base = [
-                        frame_res['pred_logits'], frame_res['pred_boxes'],
-                        frame_res['ref_pts'], frame_res['hs'],
-                    ]
-                    if self.detection_transformer is not None:
-                        base.extend([
-                            frame_res['det_pred_logits'],
-                            frame_res['det_pred_boxes'],
-                        ])
-                    aux = frame_res.get('aux_outputs', [])
-                    return tuple(base +
-                                 [a['pred_logits'] for a in aux] +
-                                 [a['pred_boxes'] for a in aux])
+            if self.use_checkpoint and self.training:
+                # Capture tensor inputs, not mutable tracking state. Matching,
+                # queues and ReID stay outside recomputation.
+                frame_keys = tuple(track_instances._fields.keys())
 
-                args = [frame] + [track_instances.get(k) for k in keys]
-                params = tuple(p for p in self.parameters() if p.requires_grad)
-                tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
-                num_aux = len(self.transformer.decoder.layers) - 1
-                aux_offset = 6 if self.detection_transformer is not None else 4
-                frame_res = {
-                    'pred_logits': tmp[0],
-                    'pred_boxes': tmp[1],
-                    'ref_pts': tmp[2],
-                    'hs': tmp[3],
-                    'aux_outputs': [
-                        {'pred_logits': tmp[aux_offset + i],
-                         'pred_boxes': tmp[aux_offset + num_aux + i]}
-                        for i in range(num_aux)
-                    ],
-                }
-                if self.detection_transformer is not None:
-                    frame_res['det_pred_logits'] = tmp[4]
-                    frame_res['det_pred_boxes'] = tmp[5]
+                def fn(image, *fields, field_names=frame_keys):
+                    state = Instances((1, 1), **dict(zip(field_names, fields)))
+                    return self._forward_single_image(
+                        nested_tensor_from_tensor_list([image]), state
+                    )
+
+                frame_res = checkpoint(
+                    fn, frame, *[track_instances.get(k).clone() for k in frame_keys],
+                    use_reentrant=False, preserve_rng_state=True,
+                )
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances)

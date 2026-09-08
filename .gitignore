@@ -2,6 +2,7 @@ __pycache__/
 *.pth
 *.train
 exps/
+output/
 build/
 *.egg
 *.egg-info

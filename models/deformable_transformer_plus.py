@@ -133,7 +133,9 @@ class DeformableTransformer(nn.Module):
         return valid_ratio
 
     def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None):
-        assert self.two_stage or query_embed is not None
+        return self.decode(self.encode(srcs, masks, pos_embeds), query_embed, ref_pts)
+
+    def encode(self, srcs, masks, pos_embeds):
 
         # prepare input for encoder
         src_flatten = []
@@ -160,6 +162,12 @@ class DeformableTransformer(nn.Module):
 
         # encoder
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+        return memory, spatial_shapes, level_start_index, valid_ratios, mask_flatten
+
+    def decode(self, encoded, query_embed=None, ref_pts=None):
+        """Decode shared image memory; supplied reference points are logits."""
+        assert self.two_stage or query_embed is not None
+        memory, spatial_shapes, level_start_index, valid_ratios, mask_flatten = encoded
         # prepare input for decoder
         bs, _, c = memory.shape
         if self.two_stage:

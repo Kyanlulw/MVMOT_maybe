@@ -19,6 +19,13 @@ def load_model(model, model_path, optimizer=None, resume=False,
     print(f'loaded {model_path}')
     state_dict = checkpoint['model']
     model_state_dict = model.state_dict()
+    # Bootstrap a missing detection decoder from a single-decoder checkpoint.
+    # Preserve explicitly trained detection weights in FusionTrack checkpoints.
+    for key in model_state_dict:
+        if key.startswith('detection_transformer.') and key not in state_dict:
+            source = 'transformer.' + key[len('detection_transformer.'):]
+            if source in state_dict and state_dict[source].shape == model_state_dict[key].shape:
+                state_dict[key] = state_dict[source].clone()
 
     # check loaded parameters and created model parameters
     msg = 'If you see this, your model does not fully load the ' + \

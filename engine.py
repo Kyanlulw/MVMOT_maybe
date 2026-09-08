@@ -85,7 +85,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
-        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+        if scheduler_step_per_iter and lr_scheduler is not None and epoch >= scheduler_start_epoch:
             lr_scheduler.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
@@ -160,7 +160,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
-        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+        if scheduler_step_per_iter and lr_scheduler is not None and epoch >= scheduler_start_epoch:
             lr_scheduler.step()
 
         # metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
@@ -327,7 +327,7 @@ def train_one_epoch_multiview_mot(model: torch.nn.Module, criterion: torch.nn.Mo
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
-        if scheduler_step_per_iter and lr_scheduler is not None and (epoch + 1) >= scheduler_start_epoch:
+        if scheduler_step_per_iter and lr_scheduler is not None and epoch >= scheduler_start_epoch:
             lr_scheduler.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)

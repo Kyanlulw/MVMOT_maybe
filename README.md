@@ -158,6 +158,24 @@ sh configs/r50_multiview_motr_smoke.sh
 
 The smoke fixture is intentionally made by repeating the two sample views across seven camera directories. It validates wiring and backpropagation only; use the WildTrack launcher for real training.
 
+The OUM-free FusionTrack path shares one image encoder between independent
+detection and tracking decoders. The uncertainty objective counts registered
+tracking and ReID losses once; CE/triplet component metrics are logging only
+when a ReID total is present. `--use_checkpoint` checkpoints every training
+frame with RNG preservation, including one-frame clips. Matching and memory
+updates remain outside recomputation. Cosine decay starts at the zero-based
+`--cosine_start_epoch`, after that many complete warmup epochs.
+
+After the shared-encoder change, use an older checkpoint via `--pretrained`
+(or the launcher's `PRETRAIN` environment variable) to start a new optimizer
+and schedule. Old optimizer states include the removed detection encoder and
+cannot be resumed directly. Trained detection-decoder weights are preserved;
+missing detection weights are initialized from corresponding tracking weights.
+
+Regression checks: `python -m unittest discover -s tests -p test_fusiontrack_regression.py`.
+CPU smoke tests establish forward/backward execution, not T4 memory fit or
+tracking accuracy. Profile the longest configured clip on the target GPUs.
+
 #### Evaluation on MOT15
 
 You can download the pretrained model of MOTR (the link is in "Main Results" session), then run following command to evaluate it on MOT15 train dataset:
