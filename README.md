@@ -153,7 +153,7 @@ The repository includes a tiny seven-camera fixture and a one-epoch launcher for
 
 ```bash
 cd MOTR
-bash configs/r50_multiview_motr_smoke.sh
+sh configs/r50_multiview_motr_smoke.sh
 ```
 
 The smoke fixture is intentionally made by repeating the two sample views across seven camera directories. It validates wiring and backpropagation only; use the WildTrack launcher for real training.
