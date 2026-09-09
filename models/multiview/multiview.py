@@ -981,6 +981,14 @@ class MultiviewMOTR(nn.Module):
             track_instances = self.criterion.get_criterion(cam_idx).match_for_single_frame(frame_res)
         else:
             self.track_bases[cam_idx].update(track_instances)
+            # Snapshot candidates before QIM drops queries without local IDs.
+            # Visualization only: never feed these candidates back as tracks.
+            if getattr(self, 'show_unassigned', False):
+                unassigned = track_instances.obj_idxes < 0
+                frame_res['unassigned'] = {
+                    'boxes': track_instances.pred_boxes[unassigned].detach().clone(),
+                    'scores': track_instances.scores[unassigned].detach().clone(),
+                }
 
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
@@ -1196,6 +1204,8 @@ class MultiviewMOTR(nn.Module):
             current_frame_by_cam[cam_idx] = max(0, self._queue_frame_idx[cam_idx] - 1)
 
             view_out = {'track_instances': post_track_instances}
+            if 'unassigned' in res:
+                view_out['unassigned'] = res['unassigned']
             if 'ref_pts' in res:
                 ref_pts = res['ref_pts']
                 img_h, img_w = ori_img_sizes[cam_idx]

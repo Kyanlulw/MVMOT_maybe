@@ -191,6 +191,23 @@ def draw_tracks_multiview(
                 cv2.putText(img, label, (x1, y1 - 2),
                            cv2.FONT_HERSHEY_SIMPLEX, float(font_scale), (255, 255, 255), text_thickness)
 
+        # Raw tracking candidates have normalized cxcywh boxes and no identity.
+        candidates = view_result.get('unassigned')
+        if candidates is not None:
+            height, width = img.shape[:2]
+            for box, score in zip(candidates['boxes'].cpu().tolist(),
+                                  candidates['scores'].cpu().tolist()):
+                if not math.isfinite(score) or score < score_thresh:
+                    continue
+                if not all(math.isfinite(value) for value in box):
+                    continue
+                cx, cy, bw, bh = box
+                x1, y1 = int((cx-bw/2)*width), int((cy-bh/2)*height)
+                x2, y2 = int((cx+bw/2)*width), int((cy+bh/2)*height)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (160, 160, 160), max(1, int(box_thickness)))
+                cv2.putText(img, f'unassigned {score:.2f}', (max(0, x1), max(12, y1-3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, float(font_scale), (220, 220, 220), 1)
+
         # Add camera label
         cv2.putText(img, cam_name, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
@@ -247,6 +264,12 @@ def main():
                        help='Output video path (AVI recommended for compatibility)')
     parser.add_argument('--score_thresh', type=float, default=0.5,
                        help='Score threshold for visualization')
+    parser.add_argument('--track_birth_thresh', type=float, default=0.7,
+                       help='Minimum score to assign a new local ID')
+    parser.add_argument('--track_keep_thresh', type=float, default=0.6,
+                       help='Scores below this count toward track expiry')
+    parser.add_argument('--show_unassigned', action='store_true',
+                       help='Also draw candidates without local IDs, labeled unassigned')
     parser.add_argument('--output_fps', type=float, default=10.0,
                        help='Output video FPS (lower value gives slower playback)')
     parser.add_argument('--box_thickness', type=int, default=1,
@@ -256,6 +279,9 @@ def main():
     parser.add_argument('--no_use_reid_query', dest='use_reid_query', action='store_false',
                        help='Disable ReID query branch during demo inference')
     args = parser.parse_args()
+
+    if not args.resume:
+        parser.error('--resume must point to a trained checkpoint file')
 
     checkpoint = None
     if args.resume:
@@ -267,6 +293,10 @@ def main():
             saved_args = saved_args if isinstance(saved_args, dict) else vars(saved_args)
             parser.set_defaults(**saved_args)
             args = parser.parse_args()
+    if not (0 <= args.track_keep_thresh <= args.track_birth_thresh <= 1):
+        parser.error('Require 0 <= track_keep_thresh <= track_birth_thresh <= 1')
+    if not 0 <= args.score_thresh <= 1:
+        parser.error('score_thresh must be between 0 and 1')
     if args.meta_arch not in ('fusiontrack_motr', 'multiview_motr'):
         raise ValueError('Multiview inference requires fusiontrack_motr or multiview_motr')
     # Camera count is a property of the input scene.
@@ -288,6 +318,13 @@ def main():
     model, criterion, postprocessors = build_model(args)
     model.to(device)
     model.eval()
+    model.show_unassigned = args.show_unassigned
+    for tracker in model.track_bases:
+        tracker.score_thresh = args.track_birth_thresh
+        tracker.filter_score_thresh = args.track_keep_thresh
+    print(f'Thresholds: ID birth={args.track_birth_thresh}, '
+          f'track keep={args.track_keep_thresh}, display={args.score_thresh}; '
+          f'show unassigned={args.show_unassigned}')
 
     # Load weights
     if checkpoint is not None:
